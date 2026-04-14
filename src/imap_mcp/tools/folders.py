@@ -123,8 +123,26 @@ async def delete_folder(
     return {"success": True, "name": name}
 
 
-async def get_or_create_folder(*args, **kwargs):
-    raise NotImplementedError("get_or_create_folder — M4")
+async def get_or_create_folder(
+    pool: ImapPool,
+    name: str,
+    account: Optional[str] = None,
+    audit: Optional[AuditLog] = None,
+) -> dict:
+    """Return a folder, creating it if it does not exist."""
+    with pool.acquire(account, "INBOX") as client:
+        raw_folders = client.list_folders()
+        existing_names = {folder_name for _, _, folder_name in raw_folders}
+
+        if name in existing_names:
+            return {"name": name, "created": False}
+
+        client.create_folder(name)
+
+    if audit:
+        audit.log(account or "default", "get_or_create_folder", {"name": name}, "created")
+
+    return {"name": name, "created": True}
 
 
 async def subscribe_folder(*args, **kwargs):
