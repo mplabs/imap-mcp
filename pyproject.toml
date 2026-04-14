@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imap-mcp"
+version = "0.1.0"
+description = "Generic IMAP/SMTP MCP server for Claude agents"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0",
+    "imapclient>=3.0",
+    "aiosmtplib>=3.0",
+    "keyring>=25",
+    "pyyaml>=6",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+sieve = ["managesieve"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+]
+
+[project.scripts]
+imap-mcp = "imap_mcp.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imap_mcp"]
+
+[tool.coverage.run]
+source = ["src/imap_mcp"]
