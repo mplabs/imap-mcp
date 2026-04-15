@@ -28,6 +28,9 @@ def resolve_secret(secret_ref: str) -> str:
 
     scheme, rest = secret_ref.split(":", 1)
 
+    if scheme == "inline":
+        return rest  # password stored directly in config; rest IS the value
+
     if scheme == "env":
         value = os.environ.get(rest)
         if value is None:
@@ -129,7 +132,8 @@ class ServerConfig:
     """HTTP server settings — only used when --transport http is passed."""
     host: str = "0.0.0.0"
     port: int = 8000
-    auth_token: str = ""      # resolved secret; required for HTTP transport
+    auth_token: str = ""         # legacy static bearer token; ignored when OAuth is used
+    issuer_url: str = ""         # OAuth issuer URL; defaults to http://<host>:<port>
     request_timeout_s: int = 60
 
 
@@ -224,13 +228,15 @@ def _parse_account(name: str, d: dict) -> AccountConfig:
 _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "imap-mcp" / "config.yaml"
 
 
-def load_config(path: Optional[str] = None) -> Config:
+def load_config(path: Optional[str] = None, optional: bool = False) -> Optional["Config"]:
     """Load and validate the config file."""
     if path is None:
         path = os.environ.get("IMAP_MCP_CONFIG", str(_DEFAULT_CONFIG_PATH))
 
     config_path = Path(path)
     if not config_path.exists():
+        if optional:
+            return None
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with config_path.open() as fh:
@@ -260,5 +266,6 @@ def _parse_server(d: Optional[dict]) -> ServerConfig:
         host=d.get("host", "0.0.0.0"),
         port=int(d.get("port", 8000)),
         auth_token=resolved_token,
+        issuer_url=d.get("issuer_url", ""),
         request_timeout_s=int(d.get("request_timeout_s", 60)),
     )

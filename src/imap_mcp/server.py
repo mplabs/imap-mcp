@@ -1,10 +1,10 @@
-"""imap-mcp MCP server — stdio and HTTP transports."""
+"""imap-mcp MCP server — stdio (Claude Code) and HTTP (Claude Cowork) transports."""
 
 from __future__ import annotations
 
-import hmac
 import json
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Callable, Optional
 
 from mcp.server import Server
@@ -871,73 +871,138 @@ async def run_stdio(cfg: Config) -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-async def run_http(cfg: Config) -> None:
-    """Run the server over streamable HTTP (for Claude Cowork and remote agents)."""
+async def run_http(
+    cfg: Optional[Config],
+    config_path: str,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    issuer_url: Optional[str] = None,
+) -> None:
+    """Run the server over streamable HTTP with OAuth setup wizard.
+
+    If cfg is None (no config file yet), the MCP tools return a helpful
+    "not configured" error. The setup wizard at /setup is always accessible
+    and does not require authentication.
+    """
     import contextlib
+    import logging
 
     import uvicorn
+    from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, RequireAuthMiddleware
+    from mcp.server.auth.provider import ProviderTokenVerifier
+    from mcp.server.auth.routes import create_auth_routes
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from pydantic import AnyHttpUrl
     from starlette.applications import Starlette
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import Response
+    from starlette.middleware import Middleware
+    from starlette.middleware.authentication import AuthenticationMiddleware
     from starlette.routing import Mount
 
-    server_cfg = cfg.server
-    token = server_cfg.auth_token
-    if not token:
-        raise ValueError(
-            "HTTP transport requires server.auth_token in config "
-            "(e.g. auth_token: \"env:IMAP_MCP_TOKEN\")"
-        )
-    token_bytes = token.encode()
+    from .oauth_provider import JsonFileOAuthProvider
+    from .setup_wizard import create_setup_routes, load_or_create_setup_key
 
-    registry = AccountRegistry(cfg)
-    mcp_server = build_server(registry)
+    logger = logging.getLogger(__name__)
+
+    # Build MCP server (works even without a config — tools fail gracefully)
+    if cfg is not None:
+        registry = AccountRegistry(cfg)
+        mcp_server = build_server(registry)
+    else:
+        # No config yet: start a bare server so OAuth + setup wizard work.
+        # All tool calls return NOT_CONFIGURED until setup completes.
+        mcp_server = _SessionServer("imap-mcp")
+        _noop_var: ContextVar[MessageResolver] = ContextVar("_noop_resolver")
+
+        def _noop_factory() -> MessageResolver:
+            return MessageResolver()
+
+        mcp_server._init_session_isolation(_noop_var, _noop_factory)
+
+        @mcp_server.list_tools()
+        async def _no_tools() -> list[types.Tool]:
+            return []
+
+        @mcp_server.call_tool()
+        async def _no_call(name: str, arguments: dict) -> list[types.TextContent]:
+            from .errors import NotConfiguredError
+            err = NotConfiguredError(
+                "imap-mcp has not been configured yet. "
+                "Complete setup at /setup to add your mail account."
+            )
+            return [types.TextContent(type="text", text=json.dumps(err.to_dict()))]
+
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         session_idle_timeout=1800,
     )
+
+    # OAuth provider + setup wizard
+    auth_provider = JsonFileOAuthProvider()
+    token_verifier = ProviderTokenVerifier(auth_provider)
+    setup_key = load_or_create_setup_key()
+
+    # Determine issuer URL
+    effective_issuer = issuer_url or (cfg.server.issuer_url if cfg else "") or f"http://{host}:{port}"
+    issuer = AnyHttpUrl(effective_issuer)
+
+    auth_routes = create_auth_routes(
+        provider=auth_provider,
+        issuer_url=issuer,
+    )
+    wizard_routes = create_setup_routes(
+        auth_provider=auth_provider,
+        config_path=Path(config_path),
+        setup_key=setup_key,
+    )
+
+    async def mcp_asgi(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    mcp_with_auth = RequireAuthMiddleware(mcp_asgi, required_scopes=[])
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
         async with session_manager.run():
             yield
 
-    async def handle_mcp(scope, receive, send):
-        await session_manager.handle_request(scope, receive, send)
-
     app = Starlette(
         lifespan=lifespan,
-        routes=[Mount("/mcp", app=handle_mcp)],
+        routes=[
+            *auth_routes,
+            *wizard_routes,
+            Mount("/mcp", app=mcp_with_auth),
+        ],
+        middleware=[
+            Middleware(
+                AuthenticationMiddleware,
+                backend=BearerAuthBackend(token_verifier),
+            ),
+        ],
     )
 
-    class _BearerAuth(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer "):
-                return Response("Unauthorized", status_code=401)
-            provided = auth[7:].encode()
-            if not hmac.compare_digest(token_bytes, provided):
-                return Response("Unauthorized", status_code=401)
-            return await call_next(request)
-
-    app.add_middleware(_BearerAuth)
-
+    timeout = cfg.server.request_timeout_s if cfg else 60
     uv_config = uvicorn.Config(
         app=app,
-        host=server_cfg.host,
-        port=server_cfg.port,
-        timeout_keep_alive=server_cfg.request_timeout_s,
+        host=host,
+        port=port,
+        timeout_keep_alive=timeout,
         log_level="info",
     )
     uv_server = uvicorn.Server(uv_config)
+
+    logger.info("imap-mcp HTTP server starting on %s:%d", host, port)
+    logger.info("Setup wizard: http://%s:%d/setup", host, port)
+    logger.info("Setup key: %s", setup_key)
+    # Also print to stdout so it's visible even without log config
+    print(f"\n  imap-mcp setup key: {setup_key}\n", flush=True)
+
     await uv_server.serve()
 
 
 def main() -> None:
     import argparse
     import asyncio
+    import os
 
     parser = argparse.ArgumentParser(description="imap-mcp MCP server")
     parser.add_argument(
@@ -958,21 +1023,34 @@ def main() -> None:
         help="Bind port for HTTP transport (overrides config)",
     )
     parser.add_argument(
+        "--issuer-url",
+        default=None,
+        dest="issuer_url",
+        help="OAuth issuer URL for HTTP transport (e.g. https://your-server.example.com)",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="Path to config file (overrides IMAP_MCP_CONFIG env var)",
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-
-    # CLI overrides for host/port
-    if args.host is not None:
-        cfg.server.host = args.host
-    if args.port is not None:
-        cfg.server.port = args.port
-
     if args.transport == "http":
-        asyncio.run(run_http(cfg))
+        # HTTP mode: config is optional (setup wizard creates it if missing)
+        cfg = load_config(args.config, optional=True)
+
+        config_path = (
+            args.config
+            or os.environ.get("IMAP_MCP_CONFIG")
+            or str(Path.home() / ".config" / "imap-mcp" / "config.yaml")
+        )
+
+        server_cfg = cfg.server if cfg else None
+        host = args.host or (server_cfg.host if server_cfg else "0.0.0.0")
+        port = args.port or (server_cfg.port if server_cfg else 8000)
+        issuer_url = args.issuer_url or (server_cfg.issuer_url if server_cfg else None)
+
+        asyncio.run(run_http(cfg, config_path, host=host, port=port, issuer_url=issuer_url or None))
     else:
+        cfg = load_config(args.config)
         asyncio.run(run_stdio(cfg))

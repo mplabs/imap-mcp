@@ -22,7 +22,14 @@
       "Bash(grep -rn \"create_starlette\\\\|StreamableHTTP\\\\|session_manager\\\\|lifespan\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/fastmcp/*.py)",
       "Bash(grep -n \"handle_request\\\\|__call__\\\\|route\\\\|path\\\\|/mcp\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/streamable_http_manager.py)",
       "Bash(grep -n \"app\\\\.run\\\\|server\\\\.run\\\\|\\\\.run\\(\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/streamable_http.py)",
-      "Bash(grep -n \"app\\\\.run\\\\|server\\\\.run\\\\|self\\\\.app\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/streamable_http_manager.py)"
+      "Bash(grep -n \"app\\\\.run\\\\|server\\\\.run\\\\|self\\\\.app\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/streamable_http_manager.py)",
+      "Bash(grep -n \"^class\\\\|^def\\\\|^async def\\\\|well-known\\\\|authorization_server\\\\|redirect\\\\|login\\\\|register\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/auth/handlers/*.py)",
+      "Bash(cat:*)",
+      "Bash(grep -n \"security_settings\\\\|TokenVerifier\\\\|verify_token\\\\|bearer\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/streamable_http_manager.py)",
+      "Bash(grep -n \"auth_server_provider\\\\|token_verifier\\\\|create_auth_routes\\\\|bearer\\\\|ProviderTokenVerifier\\\\|streamable_http_app\\\\|auth_middleware\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/server/fastmcp/server.py)",
+      "Bash(python3:*)",
+      "Bash(grep -n \"class OAuthToken\\\\|access_token\\\\|expires_in\\\\|refresh_token\\\\|scope\\\\|token_type\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/shared/auth.py)",
+      "Bash(grep -n \"class OAuthClientInformationFull\\\\|client_id\\\\|redirect_uris\\\\|model_fields\\\\|model_dump\" /Users/mplabs/Nextcloud/Code/mplabs/imap-mcp/.venv/lib/python*/site-packages/mcp/shared/auth.py)"
     ]
   }
 }

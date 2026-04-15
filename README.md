@@ -69,31 +69,30 @@ An MCP server that gives Claude agents full access to any IMAP mailbox (plus SMT
 
 ### Claude Cowork (remote, HTTP + Docker)
 
-1. **Create a config directory** on your server with a `config.yaml` (same format as above, but also add a `server:` block):
-   ```yaml
-   server:
-     auth_token: "env:IMAP_MCP_TOKEN"
-
-   default_account: personal
-   accounts:
-     personal:
-       # ... same as above
-   ```
-
-2. **Generate a bearer token** (any long random string):
+1. **Create a config directory** and start the server:
    ```bash
-   openssl rand -hex 32
-   # → e.g. a3f9c2d1...
+   mkdir -p config
+   docker compose up -d
+   ```
+   No config file needed — the setup wizard creates it.
+
+2. **Note the setup key** printed in the server logs:
+   ```
+   docker compose logs imap-mcp
+   # look for:  imap-mcp setup key: abc123...
    ```
 
-3. **Start with Docker Compose**:
-   ```bash
-   IMAP_MCP_TOKEN=<your-token> IMAP_PASS=<your-app-password> docker compose up -d
-   ```
+3. **Add to Claude Cowork** — paste `https://your-server:8000/mcp` as the server URL. Claude Cowork will open a browser window to the setup wizard automatically.
 
-4. **Add to Claude Cowork** — point it at `https://your-server:8000/mcp` with bearer token `<your-token>`.
+4. **Fill in your mail credentials** and paste the setup key when prompted. The server tests the connection live and saves the config. Done — Claude Cowork is connected.
 
    > **TLS required for public deployments.** The server itself does not terminate TLS. Put nginx, Caddy, or a load balancer in front. See [TLS with a reverse proxy](#tls-with-a-reverse-proxy).
+   >
+   > For a public server, also set `issuer_url` in the server config block:
+   > ```yaml
+   > server:
+   >   issuer_url: "https://your-server.example.com"
+   > ```
 
 ---
 
@@ -276,7 +275,8 @@ imap-mcp [--transport stdio|http] [--host HOST] [--port PORT] [--config PATH]
 | `--transport` | `stdio` | `stdio` for Claude Code; `http` for Claude Cowork |
 | `--host` | `0.0.0.0` | Bind host (HTTP only; overrides config) |
 | `--port` | `8000` | Bind port (HTTP only; overrides config) |
-| `--config` | `~/.config/imap-mcp/config.yaml` | Config file path |
+| `--issuer-url` | `http://host:port` | Public OAuth issuer URL; set to your HTTPS URL in production |
+| `--config` | `~/.config/imap-mcp/config.yaml` | Config file path (created by setup wizard if absent) |
 
 ---
 
@@ -285,36 +285,18 @@ imap-mcp [--transport stdio|http] [--host HOST] [--port PORT] [--config PATH]
 ### Build and run
 
 ```bash
-# Create your config directory
 mkdir -p config
-
-# Put your config.yaml there (with server.auth_token: "env:IMAP_MCP_TOKEN")
-cp your-config.yaml config/config.yaml
-
-# Generate a random bearer token
-export IMAP_MCP_TOKEN=$(openssl rand -hex 32)
-export IMAP_PASS=your-app-password
-
 docker compose up -d
+
+# Get the setup key from the logs
+docker compose logs imap-mcp | grep "setup key"
 ```
+
+Then add `https://your-server:8000/mcp` to Claude Cowork. The browser-based setup wizard handles the rest.
 
 ### docker-compose.yml
 
-The included `docker-compose.yml` maps port 8000 and passes environment variables. Add a secret env var line for each account:
-
-```yaml
-services:
-  imap-mcp:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./config:/config:ro
-    environment:
-      - IMAP_MCP_TOKEN=${IMAP_MCP_TOKEN}
-      - IMAP_PASS=${IMAP_PASS}      # add one per account
-    restart: unless-stopped
-```
+The included `docker-compose.yml` mounts the config directory read-write so the setup wizard can create `config.yaml` on first start.
 
 ### TLS with a reverse proxy
 

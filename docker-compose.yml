@@ -4,9 +4,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./config:/config:ro
+      # rw so the setup wizard can write config.yaml on first start
+      - ./config:/config
     environment:
-      - IMAP_MCP_TOKEN=${IMAP_MCP_TOKEN}
-      # Add one entry per account secret, matching the secret_refs in config.yaml.
+      # No credentials needed here — the setup wizard collects them via the browser.
+      # Add env vars only if you use secret_ref: "env:..." in a manually written config.
       # Example: - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
     restart: unless-stopped
