@@ -250,3 +250,36 @@ class TestLoadConfig:
         monkeypatch.setenv("IMAP_PERSONAL_PASS", "secret")
         cfg = load_config()
         assert cfg.default_account == "personal"
+
+    def test_server_defaults_when_absent(self, config_file):
+        path = config_file(MINIMAL_YAML)
+        with patch.dict(os.environ, {"IMAP_PERSONAL_PASS": "x"}):
+            cfg = load_config(path)
+        assert cfg.server.host == "0.0.0.0"
+        assert cfg.server.port == 8000
+        assert cfg.server.auth_token == ""
+        assert cfg.server.request_timeout_s == 60
+
+    def test_server_block_parsed(self, config_file, tmp_path):
+        yaml_with_server = MINIMAL_YAML + textwrap.dedent("""\
+
+            server:
+              host: 127.0.0.1
+              port: 9000
+              auth_token: "env:IMAP_MCP_TOKEN"
+              request_timeout_s: 30
+        """)
+        path = config_file(yaml_with_server)
+        with patch.dict(os.environ, {"IMAP_PERSONAL_PASS": "x", "IMAP_MCP_TOKEN": "tok123"}):
+            cfg = load_config(path)
+        assert cfg.server.host == "127.0.0.1"
+        assert cfg.server.port == 9000
+        assert cfg.server.auth_token == "tok123"   # secret resolved
+        assert cfg.server.request_timeout_s == 30
+
+    def test_server_auth_token_resolved_via_env(self, config_file):
+        yaml_with_token = MINIMAL_YAML + "\nserver:\n  auth_token: \"env:MY_TOKEN\"\n"
+        path = config_file(yaml_with_token)
+        with patch.dict(os.environ, {"IMAP_PERSONAL_PASS": "x", "MY_TOKEN": "mysecret"}):
+            cfg = load_config(path)
+        assert cfg.server.auth_token == "mysecret"

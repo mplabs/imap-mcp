@@ -1,9 +1,11 @@
-"""imap-mcp MCP server — stdio transport."""
+"""imap-mcp MCP server — stdio and HTTP transports."""
 
 from __future__ import annotations
 
+import hmac
 import json
-from typing import Optional
+from contextvars import ContextVar
+from typing import Callable, Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -11,7 +13,7 @@ from mcp import types
 
 from .accounts import AccountRegistry
 from .audit import AuditLog
-from .config import load_config
+from .config import load_config, Config
 from .context import Context
 from .errors import ImapMcpError
 from .imap_pool import ImapPool
@@ -669,10 +671,62 @@ def _build_dispatch(ctx: Context, registry: AccountRegistry):
 
 
 # ---------------------------------------------------------------------------
+# Per-session resolver isolation
+# ---------------------------------------------------------------------------
+
+class _ResolverProxy(MessageResolver):
+    """Proxy that delegates to the active session's resolver via a ContextVar.
+
+    Under stdio there is exactly one session so the ContextVar is set once.
+    Under HTTP each MCP session gets its own MessageResolver instance; this
+    proxy makes the switch transparent to all tool code.
+    """
+
+    def __init__(self, var: ContextVar[MessageResolver], default: MessageResolver) -> None:
+        # Intentionally skip MessageResolver.__init__ — we forward all calls.
+        self._var = var
+        self._default = default
+
+    def _active(self) -> MessageResolver:
+        try:
+            return self._var.get()
+        except LookupError:
+            return self._default
+
+    def register(self, message_id: str, folder: str, uid: int, uidvalidity: int) -> None:
+        self._active().register(message_id, folder, uid, uidvalidity)
+
+    def register_many(self, results: list[dict]) -> None:
+        self._active().register_many(results)
+
+    def resolve(self, id: str, pool, account: Optional[str] = None):  # type: ignore[override]
+        return self._active().resolve(id, pool, account)
+
+
+class _SessionServer(Server):
+    """Server subclass that creates a fresh MessageResolver per session run."""
+
+    def _init_session_isolation(
+        self,
+        var: ContextVar[MessageResolver],
+        factory: Callable[[], MessageResolver],
+    ) -> None:
+        self._resolver_var = var
+        self._resolver_factory = factory
+
+    async def run(self, read_stream, write_stream, initialization_options):  # type: ignore[override]
+        tok = self._resolver_var.set(self._resolver_factory())
+        try:
+            await super().run(read_stream, write_stream, initialization_options)
+        finally:
+            self._resolver_var.reset(tok)
+
+
+# ---------------------------------------------------------------------------
 # Server factory
 # ---------------------------------------------------------------------------
 
-def build_server(registry: AccountRegistry) -> Server:
+def build_server(registry: AccountRegistry) -> _SessionServer:
     rate_limiter = RateLimiter()
     for acc_name in registry.list_names():
         acc = registry.get(acc_name)
@@ -681,11 +735,18 @@ def build_server(registry: AccountRegistry) -> Server:
     pool = ImapPool(registry, rate_limiter=rate_limiter)
     audit = AuditLog()
     _, default_acc = registry.resolve(None)
-    resolver = MessageResolver(max_search_folders=default_acc.resolver.max_search_folders)
-    ctx = Context(pool=pool, registry=registry, audit=audit, resolver=resolver)
+    max_sf = default_acc.resolver.max_search_folders
+
+    resolver_var: ContextVar[MessageResolver] = ContextVar("_session_resolver")
+
+    def resolver_factory() -> MessageResolver:
+        return MessageResolver(max_search_folders=max_sf)
+    resolver_proxy = _ResolverProxy(resolver_var, resolver_factory())
+    ctx = Context(pool=pool, registry=registry, audit=audit, resolver=resolver_proxy)
     dispatch = _build_dispatch(ctx, registry)
 
-    server = Server("imap-mcp")
+    server = _SessionServer("imap-mcp")
+    server._init_session_isolation(resolver_var, resolver_factory)
 
     @server.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
@@ -802,14 +863,116 @@ def build_server(registry: AccountRegistry) -> Server:
     return server
 
 
-async def run():
-    cfg = load_config()
+async def run_stdio(cfg: Config) -> None:
+    """Run the server over stdio (for Claude Code and local tooling)."""
     registry = AccountRegistry(cfg)
     server = build_server(registry)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def main():
+async def run_http(cfg: Config) -> None:
+    """Run the server over streamable HTTP (for Claude Cowork and remote agents)."""
+    import contextlib
+
+    import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Mount
+
+    server_cfg = cfg.server
+    token = server_cfg.auth_token
+    if not token:
+        raise ValueError(
+            "HTTP transport requires server.auth_token in config "
+            "(e.g. auth_token: \"env:IMAP_MCP_TOKEN\")"
+        )
+    token_bytes = token.encode()
+
+    registry = AccountRegistry(cfg)
+    mcp_server = build_server(registry)
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_server,
+        session_idle_timeout=1800,
+    )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with session_manager.run():
+            yield
+
+    async def handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    app = Starlette(
+        lifespan=lifespan,
+        routes=[Mount("/mcp", app=handle_mcp)],
+    )
+
+    class _BearerAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return Response("Unauthorized", status_code=401)
+            provided = auth[7:].encode()
+            if not hmac.compare_digest(token_bytes, provided):
+                return Response("Unauthorized", status_code=401)
+            return await call_next(request)
+
+    app.add_middleware(_BearerAuth)
+
+    uv_config = uvicorn.Config(
+        app=app,
+        host=server_cfg.host,
+        port=server_cfg.port,
+        timeout_keep_alive=server_cfg.request_timeout_s,
+        log_level="info",
+    )
+    uv_server = uvicorn.Server(uv_config)
+    await uv_server.serve()
+
+
+def main() -> None:
+    import argparse
     import asyncio
-    asyncio.run(run())
+
+    parser = argparse.ArgumentParser(description="imap-mcp MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Transport to use (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind host for HTTP transport (overrides config)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port for HTTP transport (overrides config)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config file (overrides IMAP_MCP_CONFIG env var)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+
+    # CLI overrides for host/port
+    if args.host is not None:
+        cfg.server.host = args.host
+    if args.port is not None:
+        cfg.server.port = args.port
+
+    if args.transport == "http":
+        asyncio.run(run_http(cfg))
+    else:
+        asyncio.run(run_stdio(cfg))

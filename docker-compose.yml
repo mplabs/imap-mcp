@@ -1,0 +1,12 @@
+services:
+  imap-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/config:ro
+    environment:
+      - IMAP_MCP_TOKEN=${IMAP_MCP_TOKEN}
+      # Add one entry per account secret, matching the secret_refs in config.yaml.
+      # Example: - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
+    restart: unless-stopped

@@ -125,6 +125,15 @@ class AttachmentConfig:
 
 
 @dataclass
+class ServerConfig:
+    """HTTP server settings — only used when --transport http is passed."""
+    host: str = "0.0.0.0"
+    port: int = 8000
+    auth_token: str = ""      # resolved secret; required for HTTP transport
+    request_timeout_s: int = 60
+
+
+@dataclass
 class AccountConfig:
     imap: ImapConfig
     smtp: SmtpConfig
@@ -141,6 +150,7 @@ class AccountConfig:
 class Config:
     default_account: str
     accounts: dict[str, AccountConfig]
+    server: ServerConfig = field(default_factory=ServerConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -236,4 +246,19 @@ def load_config(path: Optional[str] = None) -> Config:
             f"default_account '{default_account}' not found in accounts: {list(accounts.keys())}"
         )
 
-    return Config(default_account=default_account, accounts=accounts)
+    server_cfg = _parse_server(raw.get("server"))
+
+    return Config(default_account=default_account, accounts=accounts, server=server_cfg)
+
+
+def _parse_server(d: Optional[dict]) -> ServerConfig:
+    if not d:
+        return ServerConfig()
+    raw_token = d.get("auth_token", "")
+    resolved_token = resolve_secret(raw_token) if raw_token else ""
+    return ServerConfig(
+        host=d.get("host", "0.0.0.0"),
+        port=int(d.get("port", 8000)),
+        auth_token=resolved_token,
+        request_timeout_s=int(d.get("request_timeout_s", 60)),
+    )

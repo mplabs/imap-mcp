@@ -6,8 +6,10 @@ MCP server ([GongRzhe/Gmail-MCP-Server]), but adapted to vanilla IMAP semantics:
 **folders** instead of labels, **flags** instead of system labels, **Sieve**
 (optional) instead of Gmail filters.
 
-Target runtime: local process, spoken to over stdio by a Claude Code / Cowork
-agent. No hosted service, no shared state.
+Target runtime: a process reachable by Claude Code and Claude Cowork agents.
+Supports two transports: **stdio** (local, for Claude Code) and **HTTP**
+(network, for Claude Cowork and other remote agents). No hosted multi-tenant
+service; one process per deployment, one config file.
 
 [GongRzhe/Gmail-MCP-Server]: https://github.com/GongRzhe/Gmail-MCP-Server
 
@@ -27,7 +29,9 @@ agent. No hosted service, no shared state.
 
 ## 2. Non-goals
 
-- No web UI, no hosted multi-tenant mode.
+- No web UI, no hosted multi-tenant mode. One deployment = one user's mail.
+  HTTP transport is in scope for v1; it enables remote agent access (Claude
+  Cowork). Persistent server-push (IDLE) is not.
 - No re-implementing a mail client (threading UI, rich rendering, calendaring).
 - No provider-specific features that leak Gmail-isms (e.g. `X-GM-LABELS`) into
   the core API. A thin `gmail_extras` module may expose them when the server
@@ -37,32 +41,59 @@ agent. No hosted service, no shared state.
 ## 3. Architecture
 
 ```
-┌──────────────┐   stdio/MCP    ┌───────────────────────────────────────┐
-│ Claude agent │ ─────────────► │ imap-mcp server                       │
-└──────────────┘                │  ├── tool dispatcher (dict-based)     │
-                                │  ├── error boundary (ImapMcpError)    │
-                                │  ├── Context(pool, registry,          │
-                                │  │         audit, resolver)           │
-                                │  ├── account registry                 │
-                                │  ├── IMAP connection manager          │
-                                │  │   (imapclient, per-call)           │
-                                │  ├── MessageResolver (session cache + │
-                                │  │   folder-scan fallback, cap=10)    │
-                                │  ├── SMTP client (aiosmtplib)         │
-                                │  ├── MIME builder/parser (stdlib)     │
-                                │  ├── Sieve client (optional)          │
-                                │  └── local cache (UIDVALIDITY map)    │
-                                └───────────────────────────────────────┘
+┌──────────────────────┐  stdio (local)  ┌───────────────────────────────────────┐
+│ Claude Code (local)  │ ──────────────► │ imap-mcp server                       │
+└──────────────────────┘                 │  ├── transport layer (stdio or HTTP)  │
+                                         │  ├── tool dispatcher (dict-based)     │
+┌──────────────────────┐  HTTP/bearer    │  ├── error boundary (ImapMcpError)    │
+│ Claude Cowork        │ ──────────────► │  ├── Context(pool, registry,          │
+│ (remote agent)       │                 │  │         audit, resolver)           │
+└──────────────────────┘                 │  ├── account registry                 │
+                                         │  ├── IMAP connection manager          │
+                                         │  │   (imapclient, per-call)           │
+                                         │  ├── MessageResolver (session cache + │
+                                         │  │   folder-scan fallback, cap=10)    │
+                                         │  ├── SMTP client (aiosmtplib)         │
+                                         │  ├── MIME builder/parser (stdlib)     │
+                                         │  ├── Sieve client (optional)          │
+                                         │  └── local cache (UIDVALIDITY map)    │
+                                         └───────────────────────────────────────┘
 ```
 
 - **Language:** Python 3.11+.
 - **MCP framework:** the official `mcp` Python SDK.
-- **Transport:** stdio only in v1.
+- **Transports:**
+  - `stdio` — default; used by Claude Code and local tooling. Started with
+    `imap-mcp` or `imap-mcp --transport stdio`.
+  - `http` — streamable HTTP (MCP spec §transport); used by Claude Cowork and
+    any remote agent. Started with `imap-mcp --transport http [--host 0.0.0.0]
+    [--port 8000]`. Requires a `server.auth_token` in config; every request must
+    carry `Authorization: Bearer <token>`. Requests without a valid token receive
+    `401 Unauthorized` and are never dispatched. Token comparison is constant-time
+    (`hmac.compare_digest`) to prevent timing attacks.
+    
+    The HTTP transport is implemented via the MCP SDK's built-in Starlette
+    integration (`mcp.server.fastmcp` / `create_starlette_app`). A Starlette
+    bearer-token middleware is added before the MCP app. Uvicorn is the ASGI
+    server.
+
+    **TLS:** the server does not terminate TLS itself. For any non-localhost
+    deployment, TLS must be provided by a reverse proxy (nginx, Caddy, etc.).
+    Running plain HTTP over a public network exposes the bearer token.
+
+    **Concurrency:** `pool`, `registry`, and `audit` are shared across concurrent
+    sessions (they are stateless or append-only). `MessageResolver` is
+    **per-session**: each MCP session receives its own `MessageResolver` instance
+    so session-local caches do not bleed across concurrent agent connections.
 - **Concurrency:** one `IMAPClient` per tool call; login → select → work →
   logout. A future LRU pool is a v2 concern.
-- **Context object:** a single `Context(pool, registry, audit, resolver)`
-  dataclass is constructed at server startup and threaded through every tool
-  call. Tools never reach into the server for global state.
+- **Context object:** `Context(pool, registry, audit, resolver)` is threaded
+  through every tool call. Under stdio, one `Context` is built at startup and
+  shared for the lifetime of the process. Under HTTP, `pool`, `registry`, and
+  `audit` are built once at startup and shared; a fresh `MessageResolver` is
+  constructed per MCP session so that session-local message caches do not bleed
+  across concurrent connections. Tools never reach into the server for global
+  state.
 - **State:** mostly stateless. The only durable state is a small JSON file
   mapping `(account, folder) → UIDVALIDITY` so the server can detect when UIDs
   have been invalidated between sessions.
@@ -74,6 +105,14 @@ Config is a single YAML file, path overridable via `IMAP_MCP_CONFIG` env var
 they're fetched from the OS keyring (`keyring` pkg) or a named env var.
 
 ```yaml
+# Optional HTTP server settings. Only used when --transport http is passed.
+server:
+  host: 0.0.0.0          # default; bind to all interfaces
+  port: 8000             # default
+  auth_token: "env:IMAP_MCP_TOKEN"  # required for HTTP transport; same
+                                     # secret_ref syntax as account auth
+  request_timeout_s: 60  # abort requests that take longer than this (default 60)
+
 default_account: personal
 
 accounts:
@@ -404,6 +443,10 @@ Defined codes: `AUTH_FAILED`, `CONNECTION_FAILED`, `FOLDER_NOT_FOUND`,
 `CONFIRMATION_REQUIRED`, `NOT_CONFIGURED`, `PROTOCOL_ERROR`, `TIMEOUT`,
 `RATE_LIMITED`.
 
+**HTTP transport errors:** auth failures at the transport layer are returned as
+plain HTTP `401 Unauthorized` before the MCP dispatcher is ever invoked. These
+are not structured MCP errors; they appear as connection failures to the caller.
+
 **Error boundary:** all `ImapMcpError` subclass exceptions raised by tool
 implementations are caught at the dispatcher level and returned as structured
 JSON in the tool result. Unhandled exceptions (programming errors) are allowed
@@ -429,11 +472,12 @@ the cap, `MESSAGE_NOT_FOUND` is returned with a `recovery` hint suggesting a
 ## 12. Dependencies
 
 ```
-mcp                >= 1.0
+mcp                >= 1.0    # Starlette is a transitive dep; no explicit pin needed
 imapclient         >= 3.0
 aiosmtplib         >= 3.0
 keyring            >= 25
 pyyaml             >= 6
+uvicorn            >= 0.30   # ASGI server for HTTP transport
 # Optional:
 managesieve        # only pulled in when Sieve is configured
 ```
@@ -442,14 +486,19 @@ managesieve        # only pulled in when Sieve is configured
 
 - **Unit tests** with `pytest` using a fake `IMAPClient` via
   monkeypatching for tool logic.
+- **Transport tests** for the HTTP transport: bearer auth enforcement (missing
+  token → 401, wrong token → 401, correct token → 200), constant-time
+  comparison, and per-session resolver isolation under concurrent requests.
 - **Integration tests** against a disposable Dovecot container
   (`ghcr.io/dovecot/dovecot`) spun up by `docker-compose.test.yml`.
 - **Contract tests** assert Gmail-MCP parity (`tests/test_parity.py`).
 
 ## 14. Milestones
 
-- **M0 — scaffolding.** Config, account registry, stdio MCP server with
-  `list_accounts` + `test_connection` only.
+- **M0 — scaffolding.** Config, account registry, MCP server with
+  `list_accounts` + `test_connection` only. Both stdio and HTTP transports
+  selectable via `--transport` flag. HTTP transport requires `server.auth_token`
+  in config.
 - **M1 — read path.** `list_folders`, `folder_status`, `list_messages`,
   `search_emails`, `read_email`, `download_attachment`.
 - **M2 — write path.** `set_flags` + wrappers, `move_email`, `copy_email`,
@@ -464,7 +513,7 @@ managesieve        # only pulled in when Sieve is configured
 ## 15. Open questions
 
 1. **Thread assembly.** Worth a v2 `read_thread` tool that walks `References`?
-2. **IDLE / push.** Stretch goal. Needs a long-lived connection outside the
-   stdio request/response loop.
+2. **IDLE / push.** Stretch goal. Only feasible with the HTTP transport (HTTP
+   streaming keeps the connection open). Not in v1.
 3. **xoauth2 implementation.** Which OAuth library? Token refresh strategy?
    Deferred to v1.1.
