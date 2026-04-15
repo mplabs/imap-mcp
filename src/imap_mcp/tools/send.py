@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import mimetypes
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import aiosmtplib
 
 from ..config import resolve_secret
+from ..errors import PermissionDeniedError
 from ..ref import Ref, encode_ref
 
 if TYPE_CHECKING:
@@ -28,12 +33,31 @@ def _build_mime(
     cc: Optional[list[str]] = None,
     bcc: Optional[list[str]] = None,
     html: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
     headers: Optional[dict] = None,
 ):
-    """Build a MIME message with required Message-ID and Date headers."""
-    if html:
+    """Build a MIME message with required Message-ID and Date headers.
+
+    attachments is a list of dicts: { path: str, filename?: str, mime?: str }
+    """
+    has_attachments = bool(attachments)
+
+    if has_attachments:
+        # multipart/mixed envelope; body goes in a nested alternative or plain part
+        outer = MIMEMultipart("mixed")
+        if html:
+            body_part = MIMEMultipart("alternative")
+            body_part.attach(MIMEText(body, "plain", "utf-8"))
+            body_part.attach(MIMEText(html, "html", "utf-8"))
+        else:
+            body_part = MIMEText(body, "plain", "utf-8")
+        outer.attach(body_part)
+        for att in attachments:
+            _attach_file(outer, att)
+        msg = outer
+    elif html:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
@@ -53,7 +77,6 @@ def _build_mime(
 
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
-        # Build References chain: prior references + in_reply_to
         if references:
             msg["References"] = f"{references} {in_reply_to}"
         else:
@@ -64,6 +87,28 @@ def _build_mime(
             msg[k] = v
 
     return msg
+
+
+def _attach_file(outer: MIMEMultipart, att: dict) -> None:
+    """Read a file from disk and attach it to the outer MIME message."""
+    path = Path(att["path"])
+    if not path.is_absolute():
+        raise PermissionDeniedError(f"attachment path must be absolute, got: {att['path']}")
+    filename = att.get("filename") or path.name
+    mime_type = att.get("mime") or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    maintype, subtype = mime_type.split("/", 1)
+
+    data = path.read_bytes()
+    if maintype == "application":
+        part = MIMEApplication(data, Name=filename)
+    else:
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(data)
+        from email import encoders
+        encoders.encode_base64(part)
+
+    part["Content-Disposition"] = f'attachment; filename="{filename}"'
+    outer.attach(part)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +123,7 @@ async def send_email(
     cc: Optional[list[str]] = None,
     bcc: Optional[list[str]] = None,
     html: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
     headers: Optional[dict] = None,
@@ -96,6 +142,7 @@ async def send_email(
         cc=cc,
         bcc=bcc,
         html=html,
+        attachments=attachments,
         in_reply_to=in_reply_to,
         references=references,
         headers=headers,
@@ -130,6 +177,7 @@ async def save_draft(
     cc: Optional[list[str]] = None,
     bcc: Optional[list[str]] = None,
     html: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
     headers: Optional[dict] = None,
@@ -148,6 +196,7 @@ async def save_draft(
         cc=cc,
         bcc=bcc,
         html=html,
+        attachments=attachments,
         in_reply_to=in_reply_to,
         references=references,
         headers=headers,

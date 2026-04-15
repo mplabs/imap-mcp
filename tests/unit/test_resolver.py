@@ -5,7 +5,6 @@ from unittest.mock import patch, MagicMock
 
 from imap_mcp.resolver import MessageResolver
 from imap_mcp.imap_pool import ImapPool, Connection
-from imap_mcp.ref import Ref
 from imap_mcp.errors import MessageNotFoundError
 
 
@@ -135,7 +134,6 @@ class TestMessageResolver:
             r.resolve("not-a-ref-or-msgid", pool)
 
     def test_register_many(self, base_registry):
-        pool = ImapPool(base_registry)
         r = MessageResolver()
         r.register_many([
             {"message_id": "<a@b.com>", "ref": "personal:INBOX:1000:1"},

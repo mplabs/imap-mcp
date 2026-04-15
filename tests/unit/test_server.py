@@ -3,10 +3,9 @@
 import json
 import os
 import textwrap
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch
 
 import pytest
-from mcp import types
 
 from imap_mcp.config import load_config
 from imap_mcp.accounts import AccountRegistry
@@ -111,6 +110,12 @@ class TestResources:
         resources = _list_resources(registry)
         uris = {str(r.resource.uri) for r in resources}
         assert "imap-mcp://accounts" in uris
+
+    def test_per_account_resources_listed(self, registry):
+        resources = _list_resources(registry)
+        uris = {str(r.resource.uri) for r in resources}
+        assert "imap-mcp://personal/folders" in uris
+        assert "imap-mcp://personal/capabilities" in uris
 
     def test_accounts_resource_content(self, registry):
         resources = _list_resources(registry)

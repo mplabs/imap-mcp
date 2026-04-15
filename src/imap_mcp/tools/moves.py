@@ -84,8 +84,6 @@ async def delete_email(
     else:
         trash_folder = acc_config.folders.trash
         await move_email(ctx, id=id, to_folder=trash_folder, account=target_account)
-        # move_email already logged; emit a delete audit entry too
-        ctx.audit.log(target_account, "delete_email", {"id": id, "hard": False}, "ok")
 
     return {"success": True, "id": id}
 

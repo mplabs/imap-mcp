@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
-from .errors import MessageNotFoundError
-from .ref import Ref, encode_ref, is_ref, is_message_id, parse_ref
+from .errors import ImapMcpError, MessageNotFoundError
+from .ref import Ref, is_ref, is_message_id, parse_ref
 
 if TYPE_CHECKING:
     from .imap_pool import ImapPool
@@ -103,8 +103,10 @@ class MessageResolver:
                             uidvalidity=conn.uidvalidity,
                             uid=uid,
                         )
+            except ImapMcpError:
+                raise
             except Exception:
-                pass
+                pass  # per-folder access error (NO response, etc.) — try next folder
 
             searched += 1
 

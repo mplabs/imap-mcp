@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 from email.mime.text import MIMEText
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -164,7 +164,7 @@ class TestSearchEmails:
         }
 
         with _patch_acquire(ctx, mock_conn):
-            result = await search_emails(
+            await search_emails(
                 ctx,
                 query={"gmail_raw": "from:alice label:unread"},
                 account="personal",
@@ -188,6 +188,27 @@ class TestSearchEmails:
             await search_emails(ctx, query={}, account="personal", folder="INBOX")
 
         mock_conn.client.search.assert_called_once_with(["ALL"])
+
+    @pytest.mark.asyncio
+    async def test_fan_out_when_no_folder(self, ctx, mock_conn):
+        """When folder is omitted, search fans out across listed folders."""
+        raw = _make_raw_message()
+        mock_conn.client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b".", "INBOX"),
+            ((b"\\HasNoChildren",), b".", "Sent"),
+        ]
+        mock_conn.client.search.return_value = [1]
+        mock_conn.client.fetch.return_value = {
+            1: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
+        }
+
+        with _patch_acquire(ctx, mock_conn):
+            result = await search_emails(
+                ctx, query={"raw": "UNSEEN"}, account="personal"
+            )
+
+        # Results from 2 folders → 2 messages (same mock returns 1 uid per folder)
+        assert len(result["results"]) == 2
 
 
 # ---------------------------------------------------------------------------

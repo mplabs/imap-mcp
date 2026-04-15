@@ -1,8 +1,6 @@
 """Tests for the audit log."""
 
 import json
-import os
-from pathlib import Path
 
 import pytest
 

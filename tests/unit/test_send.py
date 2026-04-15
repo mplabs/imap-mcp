@@ -1,9 +1,8 @@
 """Tests for send_email and save_draft."""
 
-import email as emaillib
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 
 from imap_mcp.tools.send import send_email, save_draft
 
@@ -105,6 +104,56 @@ class TestSendEmail:
         msg = captured["msg"]
         assert msg["In-Reply-To"] == "<original-123@example.com>"
         assert "<original-123@example.com>" in msg["References"]
+
+
+class TestAttachments:
+    @pytest.mark.asyncio
+    async def test_send_with_attachment(self, ctx, mock_conn, tmp_path):
+        att_file = tmp_path / "report.pdf"
+        att_file.write_bytes(b"%PDF-1.4 fake")
+
+        captured = {}
+
+        async def _capture_send(msg, **kwargs):
+            captured["msg"] = msg
+
+        with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
+            mock_smtp.send = AsyncMock(side_effect=_capture_send)
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
+                    result = await send_email(
+                        ctx,
+                        to=["bob@example.com"],
+                        subject="With attachment",
+                        body="See attached",
+                        attachments=[{"path": str(att_file)}],
+                        account="personal",
+                    )
+
+        assert result["success"] is True
+        msg = captured["msg"]
+        assert msg.get_content_type() == "multipart/mixed"
+        parts = list(msg.walk())
+        filenames = [p.get_filename() for p in parts if p.get_filename()]
+        assert "report.pdf" in filenames
+
+    @pytest.mark.asyncio
+    async def test_attachment_relative_path_rejected(self, ctx, mock_conn):
+        from imap_mcp.errors import PermissionDeniedError
+
+        with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
+            mock_smtp.send = AsyncMock()
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
+                    with pytest.raises(PermissionDeniedError, match="absolute"):
+                        await send_email(
+                            ctx,
+                            to=["bob@example.com"],
+                            subject="Bad",
+                            body="body",
+                            attachments=[{"path": "relative/path.txt"}],
+                            account="personal",
+                        )
 
 
 class TestSaveDraft:

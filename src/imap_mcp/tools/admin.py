@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Optional
 
+import aiosmtplib
 from imapclient import IMAPClient
 
 from ..accounts import AccountRegistry
 from ..config import resolve_secret
-from ..errors import AuthFailedError, ConnectionFailedError
 
 
 def list_accounts(registry: AccountRegistry) -> dict:
@@ -32,11 +32,19 @@ def list_accounts(registry: AccountRegistry) -> dict:
 
 
 async def test_connection(registry: AccountRegistry, account: Optional[str] = None) -> dict:
-    """Perform a LOGIN / NOOP / LOGOUT round-trip to verify connectivity.
+    """Verify IMAP and SMTP connectivity independently.
 
-    Returns a dict with keys: success (bool), account (str), and on failure: error (str).
+    Returns:
+        {
+            "success": bool,       # True only when both IMAP and SMTP are ok
+            "account": str,
+            "imap": "ok" | "<error message>",
+            "smtp": "ok" | "<error message>",
+        }
     """
     name, acc = registry.resolve(account)
+
+    # --- IMAP ---
     try:
         password = resolve_secret(acc.imap.auth.secret_ref)
         with IMAPClient(
@@ -46,7 +54,30 @@ async def test_connection(registry: AccountRegistry, account: Optional[str] = No
         ) as client:
             client.login(acc.imap.username, password)
             client.noop()
-            client.logout()
-        return {"success": True, "account": name}
+        imap_result = "ok"
     except Exception as exc:
-        return {"success": False, "account": name, "error": str(exc)}
+        imap_result = str(exc)
+
+    # --- SMTP ---
+    try:
+        smtp_password = resolve_secret(acc.smtp.auth.secret_ref)
+        smtp = aiosmtplib.SMTP(
+            hostname=acc.smtp.host,
+            port=acc.smtp.port,
+            use_tls=acc.smtp.tls,
+            start_tls=acc.smtp.starttls,
+        )
+        await smtp.connect()
+        await smtp.login(acc.smtp.username, smtp_password)
+        await smtp.quit()
+        smtp_result = "ok"
+    except Exception as exc:
+        smtp_result = str(exc)
+
+    success = imap_result == "ok" and smtp_result == "ok"
+    return {
+        "success": success,
+        "account": name,
+        "imap": imap_result,
+        "smtp": smtp_result,
+    }

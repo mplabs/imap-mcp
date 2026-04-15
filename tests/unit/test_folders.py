@@ -2,7 +2,7 @@
 
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from imap_mcp.tools.folders import list_folders, folder_status
 
@@ -23,6 +23,10 @@ class TestListFolders:
             ((b"\\HasNoChildren", b"\\Sent"), b".", "Sent"),
             ((b"\\HasNoChildren", b"\\Drafts"), b".", "Drafts"),
         ]
+        mock_conn.client.lsub.return_value = [
+            ((b"\\HasNoChildren",), b".", "INBOX"),
+            ((b"\\HasNoChildren", b"\\Sent"), b".", "Sent"),
+        ]
 
         with _patch_acquire(ctx, mock_conn):
             result = await list_folders(ctx, account="personal")
@@ -37,6 +41,9 @@ class TestListFolders:
         mock_conn.client.list_folders.return_value = [
             ((b"\\HasNoChildren",), b".", "INBOX"),
         ]
+        mock_conn.client.lsub.return_value = [
+            ((b"\\HasNoChildren",), b".", "INBOX"),
+        ]
 
         with _patch_acquire(ctx, mock_conn):
             result = await list_folders(ctx, account="personal")
@@ -45,6 +52,25 @@ class TestListFolders:
         assert "name" in folder
         assert "flags" in folder
         assert "delimiter" in folder
+        assert "subscribed" in folder
+
+    @pytest.mark.asyncio
+    async def test_subscribed_state_accurate(self, ctx, mock_conn):
+        mock_conn.client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b".", "INBOX"),
+            ((b"\\HasNoChildren",), b".", "Archive"),
+        ]
+        # Only INBOX is subscribed
+        mock_conn.client.lsub.return_value = [
+            ((b"\\HasNoChildren",), b".", "INBOX"),
+        ]
+
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_folders(ctx, account="personal")
+
+        by_name = {f["name"]: f for f in result["folders"]}
+        assert by_name["INBOX"]["subscribed"] is True
+        assert by_name["Archive"]["subscribed"] is False
 
 
 class TestFolderStatus:

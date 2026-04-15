@@ -2,7 +2,7 @@
 
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from imap_mcp.tools.folders import create_folder, rename_folder, delete_folder
 from imap_mcp.errors import PermissionDeniedError

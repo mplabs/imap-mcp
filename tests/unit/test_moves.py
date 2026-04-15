@@ -2,7 +2,7 @@
 
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from imap_mcp.tools.moves import move_email, copy_email, delete_email, empty_trash
 from imap_mcp.errors import PermissionDeniedError, StaleRefError

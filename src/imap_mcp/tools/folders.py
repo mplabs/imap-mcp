@@ -21,9 +21,13 @@ async def list_folders(
     ctx: "Context",
     account: Optional[str] = None,
 ) -> dict:
-    """List all folders on the IMAP server."""
+    """List all folders on the IMAP server, including subscribed state."""
     with ctx.pool.acquire(account, "INBOX") as conn:
         raw_folders = conn.client.list_folders()
+        # lsub() returns the set of subscribed folders
+        subscribed_raw = conn.client.lsub()
+
+    subscribed_names = {name for _, _, name in subscribed_raw}
 
     folders = []
     for flags, delimiter, name in raw_folders:
@@ -33,6 +37,7 @@ async def list_folders(
             "name": name,
             "flags": flag_strs,
             "delimiter": delim_str,
+            "subscribed": name in subscribed_names,
         })
 
     return {"folders": folders}

@@ -15,6 +15,7 @@ from .config import load_config
 from .context import Context
 from .errors import ImapMcpError
 from .imap_pool import ImapPool
+from .rate_limit import RateLimiter
 from .resolver import MessageResolver
 from .tools.admin import list_accounts, test_connection
 from .tools.batch import batch_set_flags, batch_move, batch_delete
@@ -66,11 +67,12 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
             name="search_emails",
             description=(
                 "Search messages. query must be {raw: string} (IMAP SEARCH string) "
-                "or {gmail_raw: string} (Gmail IMAP only)."
+                "or {gmail_raw: string} (Gmail IMAP only). "
+                "Omit folder to fan out across all subscribed folders (capped at resolver.max_search_folders)."
             ),
             inputSchema={"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "object"},
-                "folder": {"type": "string"},
+                "folder": {"type": "string", "description": "Omit to search all folders."},
                 "limit": {"type": "integer"},
                 "cursor": {"type": "string"},
                 "order": {"type": "string", "enum": ["newest", "oldest"]},
@@ -250,6 +252,18 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "html": {"type": "string"},
+                "attachments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string", "description": "Absolute path to file."},
+                            "filename": {"type": "string"},
+                            "mime": {"type": "string"},
+                        },
+                    },
+                },
                 "in_reply_to": {"type": "string"},
                 "references": {"type": "string"},
                 "headers": {"type": "object"},
@@ -266,6 +280,18 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "html": {"type": "string"},
+                "attachments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string", "description": "Absolute path to file."},
+                            "filename": {"type": "string"},
+                            "mime": {"type": "string"},
+                        },
+                    },
+                },
                 "in_reply_to": {"type": "string"},
                 "references": {"type": "string"},
                 "headers": {"type": "object"},
@@ -326,9 +352,10 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
 # ---------------------------------------------------------------------------
 
 def _list_resources(registry: AccountRegistry) -> list[types.EmbeddedResource]:
-    """Return static MCP resources for agent reference."""
+    """Return the static accounts resource; dynamic per-account resources are
+    registered at server startup and served via handle_read_resource."""
     accounts_info = list_accounts(registry)
-    return [
+    resources = [
         types.EmbeddedResource(
             type="resource",
             resource=types.TextResourceContents(
@@ -338,6 +365,53 @@ def _list_resources(registry: AccountRegistry) -> list[types.EmbeddedResource]:
             ),
         ),
     ]
+    # Add placeholder entries for per-account resources so they appear in
+    # list_resources even though their content is fetched dynamically.
+    for name in registry.list_names():
+        for suffix in ("folders", "capabilities"):
+            resources.append(
+                types.EmbeddedResource(
+                    type="resource",
+                    resource=types.TextResourceContents(
+                        uri=f"imap-mcp://{name}/{suffix}",
+                        text="",  # populated on read_resource
+                        mimeType="application/json",
+                    ),
+                )
+            )
+    return resources
+
+
+def _fetch_folders_resource(ctx: Context, account: str) -> str:
+    """Return a JSON snapshot of the folder tree for one account."""
+    import asyncio
+    from .tools.folders import list_folders as _list_folders
+
+    async def _get():
+        return await _list_folders(ctx, account=account)
+
+    data = asyncio.get_event_loop().run_until_complete(_get())
+    return json.dumps(data, indent=2)
+
+
+def _fetch_capabilities_resource(ctx: Context, account: str) -> str:
+    """Return raw IMAP CAPABILITY and SMTP EHLO tokens for one account."""
+    from imapclient import IMAPClient as _IMAPClient
+    from .config import resolve_secret as _resolve_secret
+
+    _, acc = ctx.registry.resolve(account)
+
+    imap_caps: list[str] = []
+    try:
+        password = _resolve_secret(acc.imap.auth.secret_ref)
+        with _IMAPClient(host=acc.imap.host, port=acc.imap.port, ssl=acc.imap.tls) as client:
+            client.login(acc.imap.username, password)
+            raw = client.capabilities()
+            imap_caps = [c.decode() if isinstance(c, bytes) else c for c in raw]
+    except Exception:
+        pass
+
+    return json.dumps({"account": account, "imap": imap_caps}, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +596,7 @@ def _build_dispatch(ctx: Context, registry: AccountRegistry):
             ctx,
             to=args["to"], subject=args["subject"], body=args["body"],
             cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
+            attachments=args.get("attachments"),
             in_reply_to=args.get("in_reply_to"), references=args.get("references"),
             headers=args.get("headers"), account=args.get("account"),
         )
@@ -531,6 +606,7 @@ def _build_dispatch(ctx: Context, registry: AccountRegistry):
             ctx,
             to=args["to"], subject=args["subject"], body=args["body"],
             cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
+            attachments=args.get("attachments"),
             in_reply_to=args.get("in_reply_to"), references=args.get("references"),
             headers=args.get("headers"), account=args.get("account"),
         )
@@ -597,9 +673,15 @@ def _build_dispatch(ctx: Context, registry: AccountRegistry):
 # ---------------------------------------------------------------------------
 
 def build_server(registry: AccountRegistry) -> Server:
-    pool = ImapPool(registry)
+    rate_limiter = RateLimiter()
+    for acc_name in registry.list_names():
+        acc = registry.get(acc_name)
+        rate_limiter.configure(acc_name, acc.rate_limit.max_ops_per_minute)
+
+    pool = ImapPool(registry, rate_limiter=rate_limiter)
     audit = AuditLog()
-    resolver = MessageResolver()
+    _, default_acc = registry.resolve(None)
+    resolver = MessageResolver(max_search_folders=default_acc.resolver.max_search_folders)
     ctx = Context(pool=pool, registry=registry, audit=audit, resolver=resolver)
     dispatch = _build_dispatch(ctx, registry)
 
@@ -623,9 +705,24 @@ def build_server(registry: AccountRegistry) -> Server:
     @server.read_resource()
     async def handle_read_resource(uri) -> str:
         uri_str = str(uri)
+
+        # Static resources
         for emb in _list_resources(registry):
-            if str(emb.resource.uri) == uri_str:
+            if str(emb.resource.uri) == uri_str and emb.resource.text:
                 return emb.resource.text
+
+        # Dynamic per-account resources: imap-mcp://{account}/{folders|capabilities}
+        prefix = "imap-mcp://"
+        if uri_str.startswith(prefix):
+            path = uri_str[len(prefix):]
+            parts = path.split("/", 1)
+            if len(parts) == 2:
+                acc_name, resource_name = parts
+                if resource_name == "folders":
+                    return _fetch_folders_resource(ctx, acc_name)
+                if resource_name == "capabilities":
+                    return _fetch_capabilities_resource(ctx, acc_name)
+
         raise ValueError(f"Resource not found: {uri}")
 
     @server.list_prompts()

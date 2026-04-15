@@ -7,10 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from imap_mcp.config import (
-    Config, AccountConfig, ImapConfig, SmtpConfig, MailServerConfig,
-    AuthConfig, IdentityConfig, FolderMappingConfig, SafetyConfig,
-    RateLimitConfig, ResolverConfig, AttachmentConfig, SieveConfig,
-    load_config, resolve_secret,
+    ImapConfig, SmtpConfig, MailServerConfig,
+    AuthConfig, load_config, resolve_secret,
 )
 
 

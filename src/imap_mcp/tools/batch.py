@@ -46,10 +46,11 @@ async def batch_set_flags(
 ) -> dict:
     """Add/remove flags on a list of messages. Uses UID STORE sets where possible."""
     resolved_account = account or parse_ref(ids[0]).account
-    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True}
+
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     groups = _group_by_folder(ids)
     for (acc_name, folder, _uidvalidity), uids in groups.items():
@@ -74,10 +75,11 @@ async def batch_move(
 ) -> dict:
     """Move a list of messages to a target folder."""
     resolved_account = account or parse_ref(ids[0]).account
-    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True, "to_folder": to_folder}
+
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     groups = _group_by_folder(ids)
     for (acc_name, folder, _uidvalidity), uids in groups.items():
@@ -104,10 +106,11 @@ async def batch_delete(
 ) -> dict:
     """Delete a list of messages (soft → Trash, or hard if permitted)."""
     resolved_account = account or parse_ref(ids[0]).account
-    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True}
+
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if hard:
         groups = _group_by_folder(ids)

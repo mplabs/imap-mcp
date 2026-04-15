@@ -2,7 +2,7 @@
 
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from imap_mcp.tools.batch import batch_set_flags, batch_move, batch_delete
 from imap_mcp.tools.folders import get_or_create_folder

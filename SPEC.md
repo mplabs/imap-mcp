@@ -212,7 +212,7 @@ Replaces Gmail's `draft_email`. Same parameters as `send_email`, but the
 message is `APPEND`ed to the `drafts` folder with the `\Draft` flag and never
 sent.
 
-**Returns** `{ success: true, ref: string, message_id: string }`.
+**Returns** `{ success: true, ref: string|null, message_id: string, account: string, folder: string }`.
 
 To obtain the `ref` after APPEND: use the `APPENDUID` response code from
 UIDPLUS (RFC 4315) when available; fall back to `SEARCH HEADER Message-ID
@@ -249,8 +249,9 @@ Parity with Gmail's `search_emails`, but with generic IMAP semantics.
     `"UNSEEN SINCE 1-Jan-2026 FROM \"alice@example.com\""`. See RFC 3501
     §6.4.4 for full syntax.
   - `{ gmail_raw: string }` — only valid for Gmail IMAP; uses `X-GM-RAW`.
-- `folder: string` (default: `INBOX`; to search all subscribed folders omit
-  this and the fan-out is capped at `resolver.max_search_folders`)
+- `folder: string` (optional; when omitted, fans out across all subscribed
+  folders capped at `resolver.max_search_folders`; defaults to `INBOX` when
+  provided)
 - `limit: number` (default 50, max 500)
 - `cursor: string` (opaque UID-based token; see Pagination below)
 - `order: "newest" | "oldest"` (default `newest`)
@@ -269,7 +270,7 @@ Returns `{ results: MessageSummary[], next_cursor?: string }` where
 Convenience: same as `search_emails` with an empty query. Useful for "show me
 the last 20 in Inbox".
 
-- `folder: string` (default `inbox`)
+- `folder: string` (default `INBOX`)
 - `limit`, `cursor`, `order` as above
 
 ### 7.4 Flags (replaces Gmail system-label management)
@@ -303,8 +304,7 @@ Thin wrappers around `set_flags` for ergonomics. Each takes `id` (or
 
 If `safety.allow_delete=false` (default) → moves to `trash` folder.
 If `safety.allow_delete=true` and caller passes `hard=true` → sets `\Deleted`
-and expunges. The `registry` parameter is always required by this tool's
-implementation; passing `registry=None` raises `PERMISSION_DENIED`.
+and expunges.
 
 #### `empty_trash`
 - `account: string`
@@ -316,10 +316,8 @@ Each batch tool accepts `ids: string[]` (mix of `message_id` and `ref` OK). If
 `len(ids) > safety.confirm_batch_threshold`, the call must include
 `confirm: true` or it returns `CONFIRMATION_REQUIRED`. All batches default to
 `dry_run: false`; passing `dry_run: true` returns the would-be effect per id
-without mutating.
-
-The `registry` parameter is required (never Optional) on all batch tools.
-Omitting it is a programming error, not a runtime safety bypass.
+without mutating. The `dry_run` check is evaluated before the confirm
+threshold, so a large dry-run batch never requires `confirm: true`.
 
 - `batch_set_flags` — parity with `batch_modify_emails`.
 - `batch_move` — parity with the folder side of `batch_modify_emails`.
@@ -436,7 +434,6 @@ imapclient         >= 3.0
 aiosmtplib         >= 3.0
 keyring            >= 25
 pyyaml             >= 6
-python-dateutil    >= 2.9
 # Optional:
 managesieve        # only pulled in when Sieve is configured
 ```

@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import TYPE_CHECKING, Generator, Optional
 
 from imapclient import IMAPClient
 
 from .accounts import AccountRegistry
 from .config import resolve_secret
+
+if TYPE_CHECKING:
+    from .rate_limit import RateLimiter
 
 
 @dataclass
@@ -31,8 +34,13 @@ class ImapPool:
     there is currently no connection reuse — each acquire() call creates
     and destroys one connection."""
 
-    def __init__(self, registry: AccountRegistry):
+    def __init__(
+        self,
+        registry: AccountRegistry,
+        rate_limiter: Optional["RateLimiter"] = None,
+    ):
         self._registry = registry
+        self._rate_limiter = rate_limiter
 
     def resolve(self, account: Optional[str]) -> tuple[str, object]:
         """Expose registry.resolve so callers don't reach into _registry."""
@@ -47,10 +55,14 @@ class ImapPool:
     ) -> Generator[Connection, None, None]:
         """Yield a Connection with *folder* selected.
 
-        The UIDVALIDITY from the SELECT response is captured once here;
-        tools must NOT call select_folder again on the returned client.
+        Consumes one rate-limit token before connecting.  Raises
+        RateLimitedError if the account bucket is exhausted.
         """
         name, acc = self._registry.resolve(account)
+
+        if self._rate_limiter is not None:
+            self._rate_limiter.consume(name)
+
         password = resolve_secret(acc.imap.auth.secret_ref)
 
         client = IMAPClient(

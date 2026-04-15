@@ -2,7 +2,7 @@
 
 import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from imap_mcp.tools.flags import set_flags, mark_read, mark_unread, star, unstar
 from imap_mcp.errors import StaleRefError

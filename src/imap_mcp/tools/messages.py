@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from ..errors import MessageNotFoundError, StaleRefError, PermissionDeniedError
-from ..ref import Ref, encode_ref, parse_ref
+from ..ref import Ref, encode_ref, parse_ref  # noqa: F401 (parse_ref used in fan-out)
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -126,6 +126,7 @@ async def list_messages(
     account: Optional[str] = None,
 ) -> dict:
     """List messages in a folder with UID-based pagination."""
+    limit = min(limit, 500)
     with ctx.pool.acquire(account, folder) as conn:
         uids = conn.client.search(["ALL"])
 
@@ -163,21 +164,85 @@ async def list_messages(
 async def search_emails(
     ctx: "Context",
     query: dict,
-    folder: str = "INBOX",
+    folder: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
     order: str = "newest",
     account: Optional[str] = None,
 ) -> dict:
-    """Search messages using a raw IMAP SEARCH string or gmail_raw."""
-    with ctx.pool.acquire(account, folder) as conn:
-        if "raw" in query:
-            criteria = [query["raw"]]
-        elif "gmail_raw" in query:
-            criteria = [f"X-GM-RAW {query['gmail_raw']}"]
-        else:
-            criteria = ["ALL"]
+    """Search messages using a raw IMAP SEARCH string or gmail_raw.
 
+    When folder is None, fans out across subscribed folders (capped at
+    resolver.max_search_folders). Results are merged and re-sorted.
+    """
+    limit = min(limit, 500)
+
+    if "raw" in query:
+        criteria = [query["raw"]]
+    elif "gmail_raw" in query:
+        criteria = [f"X-GM-RAW {query['gmail_raw']}"]
+    else:
+        criteria = ["ALL"]
+
+    if folder is not None:
+        return await _search_single_folder(
+            ctx, criteria, folder, limit, cursor, order, account
+        )
+
+    # Fan-out: collect selectable folders up to the resolver cap
+    _, default_acc = ctx.registry.resolve(account)
+    max_folders = default_acc.resolver.max_search_folders
+
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        all_folders = conn.client.list_folders()
+
+    selectable = [
+        name for flags, _, name in all_folders
+        if "\\Noselect" not in {
+            f.decode() if isinstance(f, bytes) else f for f in flags
+        }
+    ][:max_folders]
+
+    all_results: list[dict] = []
+    for folder_name in selectable:
+        try:
+            res = await _search_single_folder(
+                ctx, criteria, folder_name, limit, None, order, account
+            )
+            all_results.extend(res["results"])
+        except Exception:
+            continue
+
+    if not all_results:
+        return {"results": [], "next_cursor": None}
+
+    # Re-sort merged results and apply cursor + limit
+    reverse = (order == "newest")
+    all_results.sort(key=lambda r: parse_ref(r["ref"]).uid, reverse=reverse)
+
+    cursor_uid = _decode_cursor(cursor)
+    if cursor_uid is not None:
+        if order == "newest":
+            all_results = [r for r in all_results if parse_ref(r["ref"]).uid < cursor_uid]
+        else:
+            all_results = [r for r in all_results if parse_ref(r["ref"]).uid > cursor_uid]
+
+    page = all_results[:limit]
+    next_cursor = _encode_cursor(parse_ref(page[-1]["ref"]).uid) if len(all_results) > limit else None
+    return {"results": page, "next_cursor": next_cursor}
+
+
+async def _search_single_folder(
+    ctx: "Context",
+    criteria: list,
+    folder: str,
+    limit: int,
+    cursor: Optional[str],
+    order: str,
+    account: Optional[str],
+) -> dict:
+    """Search within a single folder and return paged results."""
+    with ctx.pool.acquire(account, folder) as conn:
         uids = conn.client.search(criteria)
 
         if order == "newest":

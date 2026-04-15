@@ -1,12 +1,10 @@
 """Tests for structured error types."""
 
-import pytest
 
 from imap_mcp.errors import (
-    ImapMcpError, ErrorCode, AuthFailedError, ConnectionFailedError,
-    FolderNotFoundError, MessageNotFoundError, StaleRefError,
-    PermissionDeniedError, ConfirmationRequiredError, NotConfiguredError,
-    ProtocolError, TimeoutError as ImapTimeoutError, RateLimitedError,
+    ImapMcpError, ErrorCode, ConnectionFailedError,
+    MessageNotFoundError, StaleRefError,
+    ConfirmationRequiredError, RateLimitedError,
 )
 
 
