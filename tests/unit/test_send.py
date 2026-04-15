@@ -2,60 +2,41 @@
 
 import email as emaillib
 import pytest
+from contextlib import contextmanager
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from imap_mcp.tools.send import send_email, save_draft
-from imap_mcp.imap_pool import ImapPool
-from imap_mcp.audit import AuditLog
 
 
-@pytest.fixture
-def pool(base_registry):
-    return ImapPool(base_registry)
+def _patch_acquire(ctx, mock_conn):
+    @contextmanager
+    def fake_acquire(account, folder, readonly=True):
+        yield mock_conn
 
-
-@pytest.fixture
-def audit(tmp_path):
-    return AuditLog(str(tmp_path / "audit.log"))
-
-
-@pytest.fixture
-def mock_imap():
-    client = MagicMock()
-    client.__enter__ = MagicMock(return_value=client)
-    client.__exit__ = MagicMock(return_value=False)
-    client.select_folder = MagicMock(return_value={b"UIDVALIDITY": 1000})
-    client.append = MagicMock(return_value=b"[APPENDUID 1000 42]")
-    return client
+    return patch.object(ctx.pool, "acquire", side_effect=fake_acquire)
 
 
 class TestSendEmail:
     @pytest.mark.asyncio
-    async def test_sends_and_appends_to_sent(self, pool, mock_imap, audit, base_registry):
+    async def test_sends_and_appends_to_sent(self, ctx, mock_conn):
         with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
             mock_smtp.send = AsyncMock()
-
-            with patch.object(pool, "acquire") as mock_acquire:
-                mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_imap)
-                mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-                with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
                     result = await send_email(
-                        pool,
-                        registry=base_registry,
+                        ctx,
                         to=["bob@example.com"],
                         subject="Hello",
                         body="World",
                         account="personal",
-                        audit=audit,
                     )
 
         assert result["success"] is True
         mock_smtp.send.assert_called_once()
-        mock_imap.append.assert_called_once()
+        mock_conn.client.append.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_smtp_message_has_correct_headers(self, pool, mock_imap, audit, base_registry):
+    async def test_message_has_correct_headers(self, ctx, mock_conn):
         captured = {}
 
         async def _capture_send(msg, **kwargs):
@@ -63,21 +44,15 @@ class TestSendEmail:
 
         with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
             mock_smtp.send = AsyncMock(side_effect=_capture_send)
-
-            with patch.object(pool, "acquire") as mock_acquire:
-                mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_imap)
-                mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-                with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
                     await send_email(
-                        pool,
-                        registry=base_registry,
+                        ctx,
                         to=["bob@example.com"],
                         cc=["carol@example.com"],
                         subject="Test Subject",
                         body="Test body",
                         account="personal",
-                        audit=audit,
                     )
 
         msg = captured["msg"]
@@ -85,7 +60,7 @@ class TestSendEmail:
         assert "bob@example.com" in msg["To"]
 
     @pytest.mark.asyncio
-    async def test_in_reply_to_sets_headers(self, pool, mock_imap, audit, base_registry):
+    async def test_message_id_and_date_generated(self, ctx, mock_conn):
         captured = {}
 
         async def _capture_send(msg, **kwargs):
@@ -93,21 +68,38 @@ class TestSendEmail:
 
         with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
             mock_smtp.send = AsyncMock(side_effect=_capture_send)
-
-            with patch.object(pool, "acquire") as mock_acquire:
-                mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_imap)
-                mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-                with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
                     await send_email(
-                        pool,
-                        registry=base_registry,
+                        ctx,
+                        to=["bob@example.com"],
+                        subject="Headers test",
+                        body="body",
+                        account="personal",
+                    )
+
+        msg = captured["msg"]
+        assert msg["Message-ID"] is not None
+        assert msg["Date"] is not None
+
+    @pytest.mark.asyncio
+    async def test_in_reply_to_sets_headers(self, ctx, mock_conn):
+        captured = {}
+
+        async def _capture_send(msg, **kwargs):
+            captured["msg"] = msg
+
+        with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
+            mock_smtp.send = AsyncMock(side_effect=_capture_send)
+            with patch("imap_mcp.tools.send.resolve_secret", return_value="pw"):
+                with _patch_acquire(ctx, mock_conn):
+                    await send_email(
+                        ctx,
                         to=["bob@example.com"],
                         subject="Re: Hello",
                         body="Reply body",
                         in_reply_to="<original-123@example.com>",
                         account="personal",
-                        audit=audit,
                     )
 
         msg = captured["msg"]
@@ -117,46 +109,54 @@ class TestSendEmail:
 
 class TestSaveDraft:
     @pytest.mark.asyncio
-    async def test_appends_to_drafts_folder(self, pool, mock_imap, audit, base_registry):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_imap)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
+    async def test_appends_to_drafts_folder(self, ctx, mock_conn):
+        mock_conn.client.search.return_value = [42]
 
+        with _patch_acquire(ctx, mock_conn):
             result = await save_draft(
-                pool,
-                registry=base_registry,
+                ctx,
                 to=["bob@example.com"],
                 subject="Draft Subject",
                 body="Draft body",
                 account="personal",
-                audit=audit,
             )
 
         assert result["success"] is True
-        mock_imap.append.assert_called_once()
-        # Check it was appended to Drafts with \\Draft flag
-        call_args = mock_imap.append.call_args
-        folder_arg = call_args[0][0]
-        flags_arg = call_args[1].get("flags") or call_args[0][2] if len(call_args[0]) > 2 else None
-        assert folder_arg == "Drafts"
+        mock_conn.client.append.assert_called_once()
+        call_args = mock_conn.client.append.call_args
+        assert call_args[0][0] == "Drafts"
 
     @pytest.mark.asyncio
-    async def test_draft_not_sent(self, pool, mock_imap, audit, base_registry):
+    async def test_draft_returns_message_id_and_ref(self, ctx, mock_conn):
+        mock_conn.client.search.return_value = [42]
+
+        with _patch_acquire(ctx, mock_conn):
+            result = await save_draft(
+                ctx,
+                to=["bob@example.com"],
+                subject="Draft",
+                body="body",
+                account="personal",
+            )
+
+        assert "message_id" in result
+        assert result["message_id"].startswith("<")
+        assert result["ref"] is not None
+        assert "Drafts" in result["ref"]
+
+    @pytest.mark.asyncio
+    async def test_draft_not_sent(self, ctx, mock_conn):
+        mock_conn.client.search.return_value = []
+
         with patch("imap_mcp.tools.send.aiosmtplib") as mock_smtp:
             mock_smtp.send = AsyncMock()
-
-            with patch.object(pool, "acquire") as mock_acquire:
-                mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_imap)
-                mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+            with _patch_acquire(ctx, mock_conn):
                 await save_draft(
-                    pool,
-                    registry=base_registry,
+                    ctx,
                     to=["bob@example.com"],
                     subject="Draft",
                     body="Not sent",
                     account="personal",
-                    audit=audit,
                 )
 
         mock_smtp.send.assert_not_called()

@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from ..errors import NotConfiguredError
 
+if TYPE_CHECKING:
+    from ..context import Context
+
 try:
     import managesieve
-    _HAS_MANAGESIEVE = True
 except ImportError:
     managesieve = None  # type: ignore[assignment]
-    _HAS_MANAGESIEVE = False
 
 try:
     from ..config import resolve_secret
@@ -19,15 +20,12 @@ except ImportError:
     resolve_secret = None  # type: ignore[assignment]
 
 
-def _get_sieve_connection(registry, account: Optional[str]):
+def _get_sieve_connection(ctx: "Context", account: Optional[str]):
     """Return a (name, acc, conn) tuple or raise NotConfiguredError."""
     if managesieve is None:
         raise NotConfiguredError("sieve")
 
-    if registry is None:
-        raise NotConfiguredError("sieve")
-
-    name, acc = registry.resolve(account)
+    name, acc = ctx.registry.resolve(account)
 
     if not hasattr(acc, "sieve") or acc.sieve is None:
         raise NotConfiguredError("sieve")
@@ -39,35 +37,35 @@ def _get_sieve_connection(registry, account: Optional[str]):
 
 
 async def list_sieve_scripts(
-    registry=None,
+    ctx: "Context",
     account: Optional[str] = None,
 ) -> dict:
     """List all Sieve scripts on the server."""
-    _name, _acc, conn = _get_sieve_connection(registry, account)
+    _name, _acc, conn = _get_sieve_connection(ctx, account)
     scripts, active = conn.listscripts()
     return {"scripts": scripts, "active": active}
 
 
 async def get_sieve_script(
-    registry=None,
+    ctx: "Context",
     name: str = "",
     account: Optional[str] = None,
 ) -> dict:
     """Fetch the content of a named Sieve script."""
-    _name, _acc, conn = _get_sieve_connection(registry, account)
+    _name, _acc, conn = _get_sieve_connection(ctx, account)
     script = conn.getscript(name)
     return {"name": name, "script": script}
 
 
 async def put_sieve_script(
-    registry=None,
+    ctx: "Context",
     name: str = "",
     script: str = "",
     account: Optional[str] = None,
     dry_run: bool = False,
 ) -> dict:
     """Create or update a Sieve script. Validates via CHECKSCRIPT first."""
-    _name, _acc, conn = _get_sieve_connection(registry, account)
+    _name, _acc, conn = _get_sieve_connection(ctx, account)
 
     ok, err = conn.checkscript(script)
     if not ok:
@@ -81,22 +79,22 @@ async def put_sieve_script(
 
 
 async def activate_sieve_script(
-    registry=None,
+    ctx: "Context",
     name: str = "",
     account: Optional[str] = None,
 ) -> dict:
     """Set a script as the active one (at most one active at a time)."""
-    _name, _acc, conn = _get_sieve_connection(registry, account)
+    _name, _acc, conn = _get_sieve_connection(ctx, account)
     conn.setactive(name)
     return {"success": True, "active": name}
 
 
 async def delete_sieve_script(
-    registry=None,
+    ctx: "Context",
     name: str = "",
     account: Optional[str] = None,
 ) -> dict:
     """Delete a named Sieve script."""
-    _name, _acc, conn = _get_sieve_connection(registry, account)
+    _name, _acc, conn = _get_sieve_connection(ctx, account)
     conn.deletescript(name)
     return {"success": True, "name": name}

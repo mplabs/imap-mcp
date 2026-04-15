@@ -1,19 +1,13 @@
 """Tests for message reading, searching, and listing tools."""
 
-import email as emaillib
-import os
-import textwrap
+from contextlib import contextmanager
 from email.mime.text import MIMEText
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from imap_mcp.tools.messages import (
-    list_messages,
-    search_emails,
-    read_email,
-)
-from imap_mcp.imap_pool import ImapPool
+from imap_mcp.tools.messages import list_messages, search_emails, read_email
+from imap_mcp.errors import StaleRefError
 
 
 # ---------------------------------------------------------------------------
@@ -36,33 +30,12 @@ def _make_raw_message(
     return msg.as_bytes()
 
 
-def _fake_fetch_response(uid: int, raw: bytes, flags=(b"\\Seen",)):
-    """Return an imapclient-style fetch dict for a single message."""
-    return {
-        uid: {
-            b"FLAGS": flags,
-            b"RFC822": raw,
-            b"RFC822.SIZE": len(raw),
-        }
-    }
+def _patch_acquire(ctx, mock_conn):
+    @contextmanager
+    def fake_acquire(account, folder, readonly=True):
+        yield mock_conn
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_client():
-    client = MagicMock()
-    client.__enter__ = MagicMock(return_value=client)
-    client.__exit__ = MagicMock(return_value=False)
-    client.select_folder = MagicMock(return_value={b"UIDVALIDITY": 1000})
-    return client
-
-
-@pytest.fixture
-def pool(base_registry):
-    return ImapPool(base_registry)
+    return patch.object(ctx.pool, "acquire", side_effect=fake_acquire)
 
 
 # ---------------------------------------------------------------------------
@@ -71,36 +44,30 @@ def pool(base_registry):
 
 class TestListMessages:
     @pytest.mark.asyncio
-    async def test_basic_list(self, pool, mock_client):
+    async def test_basic_list(self, ctx, mock_conn):
         raw = _make_raw_message()
-        mock_client.search.return_value = [1, 2]
-        mock_client.fetch.return_value = {
+        mock_conn.client.search.return_value = [1, 2]
+        mock_conn.client.fetch.return_value = {
             1: {b"FLAGS": (b"\\Seen",), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
             2: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
         }
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-            result = await list_messages(pool, account="personal", folder="INBOX", limit=10)
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=10)
 
         assert "results" in result
         assert len(result["results"]) == 2
 
     @pytest.mark.asyncio
-    async def test_result_contains_expected_fields(self, pool, mock_client):
+    async def test_result_contains_expected_fields(self, ctx, mock_conn):
         raw = _make_raw_message(subject="Hello", from_addr="alice@example.com")
-        mock_client.search.return_value = [42]
-        mock_client.fetch.return_value = {
+        mock_conn.client.search.return_value = [42]
+        mock_conn.client.fetch.return_value = {
             42: {b"FLAGS": (b"\\Seen",), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
         }
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-            result = await list_messages(pool, account="personal", folder="INBOX", limit=10)
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=10)
 
         msg = result["results"][0]
         assert msg["subject"] == "Hello"
@@ -111,36 +78,56 @@ class TestListMessages:
         assert "snippet" in msg
 
     @pytest.mark.asyncio
-    async def test_empty_folder(self, pool, mock_client):
-        mock_client.search.return_value = []
-        mock_client.fetch.return_value = {}
+    async def test_empty_folder(self, ctx, mock_conn):
+        mock_conn.client.search.return_value = []
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-            result = await list_messages(pool, account="personal", folder="INBOX", limit=10)
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=10)
 
         assert result["results"] == []
 
     @pytest.mark.asyncio
-    async def test_limit_respected(self, pool, mock_client):
+    async def test_limit_respected(self, ctx, mock_conn):
         raw = _make_raw_message()
-        # Server returns 20 UIDs
-        mock_client.search.return_value = list(range(1, 21))
-        fetch_data = {
+        mock_conn.client.search.return_value = list(range(1, 21))
+        mock_conn.client.fetch.return_value = {
             i: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)}
             for i in range(1, 21)
         }
-        mock_client.fetch.return_value = fetch_data
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
-            result = await list_messages(pool, account="personal", folder="INBOX", limit=5)
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=5)
 
         assert len(result["results"]) <= 5
+
+    @pytest.mark.asyncio
+    async def test_next_cursor_set_when_more_available(self, ctx, mock_conn):
+        raw = _make_raw_message()
+        mock_conn.client.search.return_value = list(range(1, 12))  # 11 items
+        mock_conn.client.fetch.return_value = {
+            i: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)}
+            for i in range(1, 12)
+        }
+
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=10)
+
+        assert result["next_cursor"] is not None
+        assert result["next_cursor"].startswith("uid:")
+
+    @pytest.mark.asyncio
+    async def test_no_cursor_when_all_fit(self, ctx, mock_conn):
+        raw = _make_raw_message()
+        mock_conn.client.search.return_value = [1, 2, 3]
+        mock_conn.client.fetch.return_value = {
+            i: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)}
+            for i in [1, 2, 3]
+        }
+
+        with _patch_acquire(ctx, mock_conn):
+            result = await list_messages(ctx, account="personal", folder="INBOX", limit=50)
+
+        assert result["next_cursor"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -149,53 +136,58 @@ class TestListMessages:
 
 class TestSearchEmails:
     @pytest.mark.asyncio
-    async def test_raw_query(self, pool, mock_client):
+    async def test_raw_query(self, ctx, mock_conn):
         raw = _make_raw_message()
-        mock_client.search.return_value = [7]
-        mock_client.fetch.return_value = {
+        mock_conn.client.search.return_value = [7]
+        mock_conn.client.fetch.return_value = {
             7: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
         }
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+        with _patch_acquire(ctx, mock_conn):
             result = await search_emails(
-                pool,
+                ctx,
                 query={"raw": "UNSEEN FROM alice@example.com"},
                 account="personal",
                 folder="INBOX",
                 limit=50,
             )
 
-        mock_client.search.assert_called_once_with(["UNSEEN FROM alice@example.com"])
+        mock_conn.client.search.assert_called_once_with(["UNSEEN FROM alice@example.com"])
         assert len(result["results"]) == 1
 
     @pytest.mark.asyncio
-    async def test_structured_query_from(self, pool, mock_client):
+    async def test_gmail_raw_query(self, ctx, mock_conn):
         raw = _make_raw_message()
-        mock_client.search.return_value = [3]
-        mock_client.fetch.return_value = {
+        mock_conn.client.search.return_value = [3]
+        mock_conn.client.fetch.return_value = {
             3: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
         }
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+        with _patch_acquire(ctx, mock_conn):
             result = await search_emails(
-                pool,
-                query={"structured": {"from": "alice@example.com", "unseen": True}},
+                ctx,
+                query={"gmail_raw": "from:alice label:unread"},
                 account="personal",
                 folder="INBOX",
                 limit=50,
             )
 
-        # Should build an IMAP search with FROM and UNSEEN criteria
-        call_args = mock_client.search.call_args[0][0]
-        criteria_str = " ".join(str(c) for c in call_args)
-        assert "FROM" in criteria_str
-        assert "UNSEEN" in criteria_str
+        mock_conn.client.search.assert_called_once_with(
+            ["X-GM-RAW from:alice label:unread"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_query_falls_back_to_all(self, ctx, mock_conn):
+        raw = _make_raw_message()
+        mock_conn.client.search.return_value = [1]
+        mock_conn.client.fetch.return_value = {
+            1: {b"FLAGS": (), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
+        }
+
+        with _patch_acquire(ctx, mock_conn):
+            await search_emails(ctx, query={}, account="personal", folder="INBOX")
+
+        mock_conn.client.search.assert_called_once_with(["ALL"])
 
 
 # ---------------------------------------------------------------------------
@@ -204,19 +196,15 @@ class TestSearchEmails:
 
 class TestReadEmail:
     @pytest.mark.asyncio
-    async def test_read_by_ref(self, pool, mock_client):
+    async def test_read_by_ref(self, ctx, mock_conn):
         raw = _make_raw_message(subject="Read Me", body="Full body text")
-        mock_client.fetch.return_value = {
+        mock_conn.client.fetch.return_value = {
             99: {b"FLAGS": (b"\\Seen",), b"RFC822": raw, b"RFC822.SIZE": len(raw)},
         }
-        mock_client.select_folder.return_value = {b"UIDVALIDITY": 1000}
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+        with _patch_acquire(ctx, mock_conn):
             result = await read_email(
-                pool,
+                ctx,
                 id="personal:INBOX:1000:99",
                 account="personal",
             )
@@ -227,18 +215,14 @@ class TestReadEmail:
         assert "attachments" in result
 
     @pytest.mark.asyncio
-    async def test_stale_ref_raises(self, pool, mock_client):
-        from imap_mcp.errors import StaleRefError
-        # UIDVALIDITY in ref is 999, but server says 1000
-        mock_client.select_folder.return_value = {b"UIDVALIDITY": 1000}
+    async def test_stale_ref_raises(self, ctx, mock_conn):
+        # ref has uidvalidity=999, but mock_conn.uidvalidity=1000 → mismatch
+        mock_conn.uidvalidity = 1000
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+        with _patch_acquire(ctx, mock_conn):
             with pytest.raises(StaleRefError):
                 await read_email(
-                    pool,
+                    ctx,
                     id="personal:INBOX:999:42",
                     account="personal",
                 )

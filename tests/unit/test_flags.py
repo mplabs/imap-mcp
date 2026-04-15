@@ -1,127 +1,90 @@
 """Tests for flag tools: set_flags, mark_read/unread, star/unstar."""
 
 import pytest
+from contextlib import contextmanager
 from unittest.mock import patch, MagicMock
 
 from imap_mcp.tools.flags import set_flags, mark_read, mark_unread, star, unstar
-from imap_mcp.imap_pool import ImapPool
-from imap_mcp.audit import AuditLog
+from imap_mcp.errors import StaleRefError
 
 
-@pytest.fixture
-def mock_client():
-    client = MagicMock()
-    client.__enter__ = MagicMock(return_value=client)
-    client.__exit__ = MagicMock(return_value=False)
-    client.select_folder = MagicMock(return_value={b"UIDVALIDITY": 1000})
-    client.add_flags = MagicMock()
-    client.remove_flags = MagicMock()
-    return client
+def _patch_acquire(ctx, mock_conn):
+    """Context manager that patches ctx.pool.acquire to yield mock_conn."""
+    @contextmanager
+    def fake_acquire(account, folder, readonly=True):
+        yield mock_conn
 
-
-@pytest.fixture
-def pool(base_registry):
-    return ImapPool(base_registry)
-
-
-@pytest.fixture
-def audit(tmp_path):
-    return AuditLog(str(tmp_path / "audit.log"))
+    return patch.object(ctx.pool, "acquire", side_effect=fake_acquire)
 
 
 class TestSetFlags:
     @pytest.mark.asyncio
-    async def test_add_seen(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+    async def test_add_seen(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
             result = await set_flags(
-                pool,
+                ctx,
                 id="personal:INBOX:1000:42",
                 add=["\\Seen"],
                 remove=[],
                 account="personal",
-                audit=audit,
             )
 
-        mock_client.add_flags.assert_called_once_with([42], ["\\Seen"])
+        mock_conn.client.add_flags.assert_called_once_with([42], ["\\Seen"])
         assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_remove_flag(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+    async def test_remove_flag(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
             await set_flags(
-                pool,
+                ctx,
                 id="personal:INBOX:1000:42",
                 add=[],
                 remove=["\\Seen"],
                 account="personal",
-                audit=audit,
             )
 
-        mock_client.remove_flags.assert_called_once_with([42], ["\\Seen"])
+        mock_conn.client.remove_flags.assert_called_once_with([42], ["\\Seen"])
 
     @pytest.mark.asyncio
-    async def test_stale_ref_raises(self, pool, mock_client, audit):
-        from imap_mcp.errors import StaleRefError
-        mock_client.select_folder.return_value = {b"UIDVALIDITY": 9999}
+    async def test_stale_ref_raises(self, ctx, mock_conn):
+        mock_conn.uidvalidity = 9999  # mismatch with ref's 1000
 
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
-
+        with _patch_acquire(ctx, mock_conn):
             with pytest.raises(StaleRefError):
                 await set_flags(
-                    pool,
+                    ctx,
                     id="personal:INBOX:1000:42",
                     add=["\\Seen"],
                     remove=[],
                     account="personal",
-                    audit=audit,
                 )
 
 
 class TestMarkReadUnread:
     @pytest.mark.asyncio
-    async def test_mark_read(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
+    async def test_mark_read(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
+            await mark_read(ctx, id="personal:INBOX:1000:1", account="personal")
 
-            await mark_read(pool, id="personal:INBOX:1000:1", account="personal", audit=audit)
-
-        mock_client.add_flags.assert_called_once_with([1], ["\\Seen"])
+        mock_conn.client.add_flags.assert_called_once_with([1], ["\\Seen"])
 
     @pytest.mark.asyncio
-    async def test_mark_unread(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
+    async def test_mark_unread(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
+            await mark_unread(ctx, id="personal:INBOX:1000:1", account="personal")
 
-            await mark_unread(pool, id="personal:INBOX:1000:1", account="personal", audit=audit)
-
-        mock_client.remove_flags.assert_called_once_with([1], ["\\Seen"])
+        mock_conn.client.remove_flags.assert_called_once_with([1], ["\\Seen"])
 
     @pytest.mark.asyncio
-    async def test_star(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
+    async def test_star(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
+            await star(ctx, id="personal:INBOX:1000:1", account="personal")
 
-            await star(pool, id="personal:INBOX:1000:1", account="personal", audit=audit)
-
-        mock_client.add_flags.assert_called_once_with([1], ["\\Flagged"])
+        mock_conn.client.add_flags.assert_called_once_with([1], ["\\Flagged"])
 
     @pytest.mark.asyncio
-    async def test_unstar(self, pool, mock_client, audit):
-        with patch.object(pool, "acquire") as mock_acquire:
-            mock_acquire.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_acquire.return_value.__exit__ = MagicMock(return_value=False)
+    async def test_unstar(self, ctx, mock_conn):
+        with _patch_acquire(ctx, mock_conn):
+            await unstar(ctx, id="personal:INBOX:1000:1", account="personal")
 
-            await unstar(pool, id="personal:INBOX:1000:1", account="personal", audit=audit)
-
-        mock_client.remove_flags.assert_called_once_with([1], ["\\Flagged"])
+        mock_conn.client.remove_flags.assert_called_once_with([1], ["\\Flagged"])

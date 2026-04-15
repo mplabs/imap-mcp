@@ -1,14 +1,9 @@
-"""Configuration loading for imap-mcp.
-
-Reads a YAML config file (path from IMAP_MCP_CONFIG env var or
-~/.config/imap-mcp/config.yaml) and resolves secrets from the OS keyring
-or environment variables.
-"""
+"""Configuration loading for imap-mcp."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -23,13 +18,12 @@ import yaml
 def resolve_secret(secret_ref: str) -> str:
     """Resolve a secret_ref string to its plain-text value.
 
-    Supported schemes:
-      env:<VAR>            — read from environment variable
-      keyring:<service>/<username>  — read from OS keyring
-      <bare string>        — returned as-is (development convenience)
+    Schemes:
+      env:<VAR>                   — read from environment variable
+      keyring:<service>/<username> — read from OS keyring
+      <bare string>               — returned as-is (dev convenience)
     """
     if ":" not in secret_ref:
-        # Bare string — no scheme; return as-is.
         return secret_ref
 
     scheme, rest = secret_ref.split(":", 1)
@@ -46,9 +40,7 @@ def resolve_secret(secret_ref: str) -> str:
         service, username = rest.split("/", 1)
         value = keyring.get_password(service, username)
         if value is None:
-            raise ValueError(
-                f"No keyring entry for service='{service}', username='{username}'"
-            )
+            raise ValueError(f"No keyring entry for service='{service}', username='{username}'")
         return value
 
     raise ValueError(f"Unsupported secret_ref scheme '{scheme}' in '{secret_ref}'")
@@ -60,12 +52,13 @@ def resolve_secret(secret_ref: str) -> str:
 
 @dataclass
 class AuthConfig:
-    method: str  # password | app_password | xoauth2
+    method: str  # password | app_password | xoauth2 (v1.1 stub)
     secret_ref: str
 
 
 @dataclass
-class ImapConfig:
+class MailServerConfig:
+    """Shared fields for IMAP and SMTP server configuration."""
     host: str
     port: int
     tls: bool
@@ -75,13 +68,22 @@ class ImapConfig:
 
 
 @dataclass
-class SmtpConfig:
+class ImapConfig(MailServerConfig):
+    pass
+
+
+@dataclass
+class SmtpConfig(MailServerConfig):
+    pass
+
+
+@dataclass
+class SieveConfig:
     host: str
     port: int
-    tls: bool
     username: str
     auth: AuthConfig
-    starttls: bool = False
+    tls: bool = False
 
 
 @dataclass
@@ -108,12 +110,31 @@ class SafetyConfig:
 
 
 @dataclass
+class RateLimitConfig:
+    max_ops_per_minute: int = 60
+
+
+@dataclass
+class ResolverConfig:
+    max_search_folders: int = 10
+
+
+@dataclass
+class AttachmentConfig:
+    max_size_mb: int = 50
+
+
+@dataclass
 class AccountConfig:
     imap: ImapConfig
     smtp: SmtpConfig
     identity: IdentityConfig
     folders: FolderMappingConfig = field(default_factory=FolderMappingConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    resolver: ResolverConfig = field(default_factory=ResolverConfig)
+    attachment: AttachmentConfig = field(default_factory=AttachmentConfig)
+    sieve: Optional[SieveConfig] = None
 
 
 @dataclass
@@ -123,75 +144,66 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# YAML → dataclass conversion
+# YAML → dataclass helpers
 # ---------------------------------------------------------------------------
 
 def _parse_auth(d: dict) -> AuthConfig:
-    return AuthConfig(
-        method=d["method"],
-        secret_ref=d["secret_ref"],
-    )
+    return AuthConfig(method=d["method"], secret_ref=d["secret_ref"])
 
 
-def _parse_imap(d: dict) -> ImapConfig:
-    return ImapConfig(
+def _parse_mail_server(d: dict, cls: type) -> MailServerConfig:
+    return cls(
         host=d["host"],
         port=int(d["port"]),
         tls=bool(d.get("tls", True)),
         username=d["username"],
         auth=_parse_auth(d["auth"]),
         starttls=bool(d.get("starttls", False)),
-    )
-
-
-def _parse_smtp(d: dict) -> SmtpConfig:
-    return SmtpConfig(
-        host=d["host"],
-        port=int(d["port"]),
-        tls=bool(d.get("tls", True)),
-        username=d["username"],
-        auth=_parse_auth(d["auth"]),
-        starttls=bool(d.get("starttls", False)),
-    )
-
-
-def _parse_identity(d: dict) -> IdentityConfig:
-    return IdentityConfig(
-        from_addr=d["from"],
-        reply_to=d.get("reply_to"),
     )
 
 
 def _parse_folders(d: Optional[dict]) -> FolderMappingConfig:
     if not d:
         return FolderMappingConfig()
-    return FolderMappingConfig(
-        inbox=d.get("inbox", "INBOX"),
-        sent=d.get("sent", "Sent"),
-        drafts=d.get("drafts", "Drafts"),
-        trash=d.get("trash", "Trash"),
-        spam=d.get("spam", "Junk"),
-        archive=d.get("archive", "Archive"),
-    )
+    # Only forward keys that exist in the dataclass; unknown keys are ignored.
+    valid = {f.name for f in fields(FolderMappingConfig)}
+    return FolderMappingConfig(**{k: v for k, v in d.items() if k in valid and v is not None})
 
 
-def _parse_safety(d: Optional[dict]) -> SafetyConfig:
+def _parse_sieve(d: Optional[dict]) -> Optional[SieveConfig]:
     if not d:
-        return SafetyConfig()
-    return SafetyConfig(
-        allow_delete=bool(d.get("allow_delete", False)),
-        allow_empty_trash=bool(d.get("allow_empty_trash", False)),
-        confirm_batch_threshold=int(d.get("confirm_batch_threshold", 25)),
+        return None
+    return SieveConfig(
+        host=d["host"],
+        port=int(d["port"]),
+        username=d["username"],
+        auth=_parse_auth(d["auth"]),
+        tls=bool(d.get("tls", False)),
     )
+
+
+def _parse_simple(d: Optional[dict], cls: type):
+    """Parse a flat YAML dict into a dataclass, using class defaults for missing keys."""
+    if not d:
+        return cls()
+    valid = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in valid and v is not None})
 
 
 def _parse_account(name: str, d: dict) -> AccountConfig:
     return AccountConfig(
-        imap=_parse_imap(d["imap"]),
-        smtp=_parse_smtp(d["smtp"]),
-        identity=_parse_identity(d["identity"]),
+        imap=_parse_mail_server(d["imap"], ImapConfig),
+        smtp=_parse_mail_server(d["smtp"], SmtpConfig),
+        identity=IdentityConfig(
+            from_addr=d["identity"]["from"],
+            reply_to=d["identity"].get("reply_to"),
+        ),
         folders=_parse_folders(d.get("folders")),
-        safety=_parse_safety(d.get("safety")),
+        safety=_parse_simple(d.get("safety"), SafetyConfig),
+        rate_limit=_parse_simple(d.get("rate_limit"), RateLimitConfig),
+        resolver=_parse_simple(d.get("resolver"), ResolverConfig),
+        attachment=_parse_simple(d.get("attachment"), AttachmentConfig),
+        sieve=_parse_sieve(d.get("sieve")),
     )
 
 
@@ -203,19 +215,7 @@ _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "imap-mcp" / "config.yaml"
 
 
 def load_config(path: Optional[str] = None) -> Config:
-    """Load and validate the config file.
-
-    Args:
-        path: Explicit path to the YAML file. If None, reads IMAP_MCP_CONFIG
-              env var; if that is also unset, uses the default location.
-
-    Returns:
-        A parsed Config instance.
-
-    Raises:
-        FileNotFoundError: if the config file does not exist.
-        ValueError: if the config is invalid (e.g. default_account not found).
-    """
+    """Load and validate the config file."""
     if path is None:
         path = os.environ.get("IMAP_MCP_CONFIG", str(_DEFAULT_CONFIG_PATH))
 

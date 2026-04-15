@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from ..audit import AuditLog
 from ..errors import PermissionDeniedError
-from ..imap_pool import ImapPool
 
-# IMAP SPECIAL-USE flags (RFC 6154) and well-known folder names that are
-# protected by default.
+if TYPE_CHECKING:
+    from ..context import Context
+
+# IMAP SPECIAL-USE flags (RFC 6154) — normalised to str for set membership.
 _SPECIAL_USE_FLAGS = frozenset({
-    b"\\Inbox", b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk", b"\\Archive",
     "\\Inbox", "\\Sent", "\\Drafts", "\\Trash", "\\Junk", "\\Archive",
 })
 
@@ -19,12 +18,12 @@ _PROTECTED_NAMES = frozenset({"INBOX"})
 
 
 async def list_folders(
-    pool: ImapPool,
+    ctx: "Context",
     account: Optional[str] = None,
 ) -> dict:
     """List all folders on the IMAP server."""
-    with pool.acquire(account, "INBOX") as client:
-        raw_folders = client.list_folders()
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        raw_folders = conn.client.list_folders()
 
     folders = []
     for flags, delimiter, name in raw_folders:
@@ -40,13 +39,13 @@ async def list_folders(
 
 
 async def folder_status(
-    pool: ImapPool,
+    ctx: "Context",
     name: str,
     account: Optional[str] = None,
 ) -> dict:
     """Return message counts and quota info for a folder."""
-    with pool.acquire(account, name) as client:
-        status = client.folder_status(name, ["MESSAGES", "UNSEEN", "RECENT"])
+    with ctx.pool.acquire(account, name) as conn:
+        status = conn.client.folder_status(name, ["MESSAGES", "UNSEEN", "RECENT"])
 
     return {
         "name": name,
@@ -57,44 +56,40 @@ async def folder_status(
 
 
 async def create_folder(
-    pool: ImapPool,
+    ctx: "Context",
     name: str,
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
 ) -> dict:
     """Create a new folder."""
-    with pool.acquire(account, "INBOX") as client:
-        client.create_folder(name)
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        conn.client.create_folder(name)
 
-    if audit:
-        audit.log(account or "default", "create_folder", {"name": name}, "ok")
-
+    ctx.audit.log(account or "default", "create_folder", {"name": name}, "ok")
     return {"success": True, "name": name}
 
 
 async def rename_folder(
-    pool: ImapPool,
+    ctx: "Context",
     from_name: str,
     to_name: str,
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
 ) -> dict:
     """Rename a folder."""
-    with pool.acquire(account, "INBOX") as client:
-        client.rename_folder(from_name, to_name)
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        conn.client.rename_folder(from_name, to_name)
 
-    if audit:
-        audit.log(account or "default", "rename_folder", {"from": from_name, "to": to_name}, "ok")
-
+    ctx.audit.log(
+        account or "default", "rename_folder",
+        {"from": from_name, "to": to_name}, "ok",
+    )
     return {"success": True, "from_name": from_name, "to_name": to_name}
 
 
 async def delete_folder(
-    pool: ImapPool,
+    ctx: "Context",
     name: str,
     account: Optional[str] = None,
     force: bool = False,
-    audit: Optional[AuditLog] = None,
 ) -> dict:
     """Delete a folder. Refuses to delete special-use folders unless force=True."""
     if not force and name in _PROTECTED_NAMES:
@@ -102,52 +97,68 @@ async def delete_folder(
             f"Cannot delete protected folder '{name}'. Pass force=True to override."
         )
 
-    with pool.acquire(account, "INBOX") as client:
+    with ctx.pool.acquire(account, "INBOX") as conn:
         if not force:
-            # Check IMAP flags for SPECIAL-USE markers
-            raw_folders = client.list_folders()
+            raw_folders = conn.client.list_folders()
             for flags, _, folder_name in raw_folders:
                 if folder_name == name:
-                    flag_set = set(f.decode() if isinstance(f, bytes) else f for f in flags)
-                    if flag_set & {f for f in _SPECIAL_USE_FLAGS if isinstance(f, str)}:
+                    flag_set = {
+                        f.decode() if isinstance(f, bytes) else f for f in flags
+                    }
+                    if flag_set & _SPECIAL_USE_FLAGS:
                         raise PermissionDeniedError(
-                            f"Cannot delete special-use folder '{name}'. Pass force=True to override."
+                            f"Cannot delete special-use folder '{name}'. "
+                            "Pass force=True to override."
                         )
                     break
 
-        client.delete_folder(name)
+        conn.client.delete_folder(name)
 
-    if audit:
-        audit.log(account or "default", "delete_folder", {"name": name, "force": force}, "ok")
-
+    ctx.audit.log(
+        account or "default", "delete_folder",
+        {"name": name, "force": force}, "ok",
+    )
     return {"success": True, "name": name}
 
 
 async def get_or_create_folder(
-    pool: ImapPool,
+    ctx: "Context",
     name: str,
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
 ) -> dict:
     """Return a folder, creating it if it does not exist."""
-    with pool.acquire(account, "INBOX") as client:
-        raw_folders = client.list_folders()
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        raw_folders = conn.client.list_folders()
         existing_names = {folder_name for _, _, folder_name in raw_folders}
 
         if name in existing_names:
             return {"name": name, "created": False}
 
-        client.create_folder(name)
+        conn.client.create_folder(name)
 
-    if audit:
-        audit.log(account or "default", "get_or_create_folder", {"name": name}, "created")
-
+    ctx.audit.log(account or "default", "get_or_create_folder", {"name": name}, "created")
     return {"name": name, "created": True}
 
 
-async def subscribe_folder(*args, **kwargs):
-    raise NotImplementedError("subscribe_folder — M2")
+async def subscribe_folder(
+    ctx: "Context",
+    name: str,
+    account: Optional[str] = None,
+) -> dict:
+    """Subscribe to a folder."""
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        conn.client.subscribe_folder(name)
+
+    return {"success": True, "name": name}
 
 
-async def unsubscribe_folder(*args, **kwargs):
-    raise NotImplementedError("unsubscribe_folder — M2")
+async def unsubscribe_folder(
+    ctx: "Context",
+    name: str,
+    account: Optional[str] = None,
+) -> dict:
+    """Unsubscribe from a folder."""
+    with ctx.pool.acquire(account, "INBOX") as conn:
+        conn.client.unsubscribe_folder(name)
+
+    return {"success": True, "name": name}

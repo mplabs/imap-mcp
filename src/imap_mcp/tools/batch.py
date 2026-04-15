@@ -3,142 +3,137 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from ..accounts import AccountRegistry
-from ..audit import AuditLog
 from ..errors import ConfirmationRequiredError
-from ..imap_pool import ImapPool
 from ..ref import parse_ref
 
+if TYPE_CHECKING:
+    from ..context import Context
 
-def _check_confirm(ids: list[str], registry: AccountRegistry, account: str, confirm: bool) -> None:
+
+def _check_confirm(
+    ids: list[str],
+    ctx: "Context",
+    account: Optional[str],
+    confirm: bool,
+) -> None:
     """Raise ConfirmationRequiredError if batch is too large and confirm is False."""
-    _, acc = registry.resolve(account)
+    _, acc = ctx.registry.resolve(account)
     threshold = acc.safety.confirm_batch_threshold
     if len(ids) > threshold and not confirm:
         raise ConfirmationRequiredError(len(ids))
 
 
-def _group_by_folder(ids: list[str]) -> dict[str, list[int]]:
-    """Group UIDs by (account, folder) key for efficient UID-set operations."""
-    groups: dict[str, list[int]] = defaultdict(list)
+def _group_by_folder(ids: list[str]) -> dict[tuple, list[int]]:
+    """Group UIDs by (account, folder, uidvalidity) key for efficient UID-set operations."""
+    groups: dict[tuple, list[int]] = defaultdict(list)
     for id_str in ids:
         ref = parse_ref(id_str)
-        key = f"{ref.account}:{ref.folder}:{ref.uidvalidity}"
+        key = (ref.account, ref.folder, ref.uidvalidity)
         groups[key].append(ref.uid)
     return groups
 
 
 async def batch_set_flags(
-    pool: ImapPool,
+    ctx: "Context",
     ids: list[str],
     add: list[str],
     remove: list[str],
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
-    registry: Optional[AccountRegistry] = None,
     confirm: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """Add/remove flags on a list of messages. Uses UID STORE sets where possible."""
-    if registry:
-        _check_confirm(ids, registry, account or parse_ref(ids[0]).account, confirm)
+    resolved_account = account or parse_ref(ids[0]).account
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True}
 
     groups = _group_by_folder(ids)
-    for key, uids in groups.items():
-        acc_name, folder, _ = key.split(":", 2)
+    for (acc_name, folder, _uidvalidity), uids in groups.items():
         target = account or acc_name
-        with pool.acquire(target, folder, readonly=False) as client:
+        with ctx.pool.acquire(target, folder, readonly=False) as conn:
             if add:
-                client.add_flags(uids, add)
+                conn.client.add_flags(uids, add)
             if remove:
-                client.remove_flags(uids, remove)
+                conn.client.remove_flags(uids, remove)
 
-    if audit and not dry_run:
-        audit.log(account or "default", "batch_set_flags", {"count": len(ids)}, "ok")
-
+    ctx.audit.log(resolved_account, "batch_set_flags", {"count": len(ids)}, "ok")
     return {"success": True, "count": len(ids), "dry_run": False}
 
 
 async def batch_move(
-    pool: ImapPool,
+    ctx: "Context",
     ids: list[str],
     to_folder: str,
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
-    registry: Optional[AccountRegistry] = None,
     confirm: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """Move a list of messages to a target folder."""
-    if registry:
-        _check_confirm(ids, registry, account or parse_ref(ids[0]).account, confirm)
+    resolved_account = account or parse_ref(ids[0]).account
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True, "to_folder": to_folder}
 
     groups = _group_by_folder(ids)
-    for key, uids in groups.items():
-        acc_name, folder, _ = key.split(":", 2)
+    for (acc_name, folder, _uidvalidity), uids in groups.items():
         target = account or acc_name
-        with pool.acquire(target, folder, readonly=False) as client:
-            client.copy(uids, to_folder)
-            client.add_flags(uids, ["\\Deleted"])
-            client.expunge()
+        with ctx.pool.acquire(target, folder, readonly=False) as conn:
+            conn.client.copy(uids, to_folder)
+            conn.client.add_flags(uids, ["\\Deleted"])
+            conn.client.expunge()
 
-    if audit and not dry_run:
-        audit.log(account or "default", "batch_move", {"count": len(ids), "to_folder": to_folder}, "ok")
-
+    ctx.audit.log(
+        resolved_account, "batch_move",
+        {"count": len(ids), "to_folder": to_folder}, "ok",
+    )
     return {"success": True, "count": len(ids), "dry_run": False, "to_folder": to_folder}
 
 
 async def batch_delete(
-    pool: ImapPool,
+    ctx: "Context",
     ids: list[str],
     hard: bool = False,
     account: Optional[str] = None,
-    audit: Optional[AuditLog] = None,
-    registry: Optional[AccountRegistry] = None,
     confirm: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """Delete a list of messages (soft → Trash, or hard if permitted)."""
-    if registry:
-        _check_confirm(ids, registry, account or parse_ref(ids[0]).account, confirm)
+    resolved_account = account or parse_ref(ids[0]).account
+    _check_confirm(ids, ctx, resolved_account, confirm)
 
     if dry_run:
         return {"success": True, "count": len(ids), "dry_run": True}
 
     if hard:
         groups = _group_by_folder(ids)
-        for key, uids in groups.items():
-            acc_name, folder, _ = key.split(":", 2)
+        for (acc_name, folder, _uidvalidity), uids in groups.items():
             target = account or acc_name
-            with pool.acquire(target, folder, readonly=False) as client:
-                client.add_flags(uids, ["\\Deleted"])
-                client.expunge()
+            with ctx.pool.acquire(target, folder, readonly=False) as conn:
+                conn.client.add_flags(uids, ["\\Deleted"])
+                conn.client.expunge()
     else:
-        # Soft delete: move each to trash folder
-        trash_folder = "Trash"
-        if registry:
-            _, acc_config = registry.resolve(account)
-            trash_folder = acc_config.folders.trash
-
+        _, acc_config = ctx.registry.resolve(resolved_account)
+        trash_folder = acc_config.folders.trash
         await batch_move(
-            pool,
+            ctx,
             ids=ids,
             to_folder=trash_folder,
             account=account,
-            audit=None,
-            registry=registry,
             confirm=confirm,
         )
+        ctx.audit.log(
+            resolved_account, "batch_delete",
+            {"count": len(ids), "hard": False}, "ok",
+        )
+        return {"success": True, "count": len(ids), "dry_run": False}
 
-    if audit and not dry_run:
-        audit.log(account or "default", "batch_delete", {"count": len(ids), "hard": hard}, "ok")
-
+    ctx.audit.log(
+        resolved_account, "batch_delete",
+        {"count": len(ids), "hard": hard}, "ok",
+    )
     return {"success": True, "count": len(ids), "dry_run": False}

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:spec.modelcontextprotocol.io)",
+      "WebSearch",
+      "WebFetch(domain:support.claude.com)",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/pytest tests/ -x --tb=no -q)",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(.venv/bin/python:*)"
+    ]
+  }
+}

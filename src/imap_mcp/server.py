@@ -11,8 +11,11 @@ from mcp import types
 
 from .accounts import AccountRegistry
 from .audit import AuditLog
-from .config import load_config, resolve_secret
+from .config import load_config
+from .context import Context
+from .errors import ImapMcpError
 from .imap_pool import ImapPool
+from .resolver import MessageResolver
 from .tools.admin import list_accounts, test_connection
 from .tools.batch import batch_set_flags, batch_move, batch_delete
 from .tools.flags import set_flags, mark_read, mark_unread, star, unstar
@@ -26,7 +29,7 @@ from .tools.send import send_email, save_draft
 
 
 # ---------------------------------------------------------------------------
-# Tool catalogue — used both for list_tools and call_tool dispatch
+# Tool catalogue
 # ---------------------------------------------------------------------------
 
 def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
@@ -54,7 +57,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {
                 "folder": {"type": "string", "description": "Folder name (default: INBOX)."},
                 "limit": {"type": "integer", "description": "Max results (default 50, max 500)."},
-                "cursor": {"type": "string", "description": "Pagination cursor."},
+                "cursor": {"type": "string", "description": "Pagination cursor (opaque uid: string)."},
                 "order": {"type": "string", "enum": ["newest", "oldest"]},
                 "account": {"type": "string"},
             }},
@@ -62,8 +65,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
         types.Tool(
             name="search_emails",
             description=(
-                "Search messages. query may be {raw: string} (IMAP SEARCH string), "
-                "{structured: {from,to,subject,body,since,before,unseen,flagged,...}}, "
+                "Search messages. query must be {raw: string} (IMAP SEARCH string) "
                 "or {gmail_raw: string} (Gmail IMAP only)."
             ),
             inputSchema={"type": "object", "required": ["query"], "properties": {
@@ -79,7 +81,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
             name="read_email",
             description="Fetch full message content (headers, text/html body, attachment manifest).",
             inputSchema={"type": "object", "required": ["id"], "properties": {
-                "id": {"type": "string", "description": "message_id or ref string."},
+                "id": {"type": "string", "description": "message_id (<…>) or ref string (account:folder:uidvalidity:uid)."},
                 "include_raw": {"type": "boolean"},
                 "account": {"type": "string"},
             }},
@@ -90,7 +92,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
             inputSchema={"type": "object", "required": ["id", "part_id", "save_to"], "properties": {
                 "id": {"type": "string"},
                 "part_id": {"type": "string"},
-                "save_to": {"type": "string"},
+                "save_to": {"type": "string", "description": "Absolute path; supports {filename} token."},
                 "account": {"type": "string"},
             }},
         ),
@@ -214,9 +216,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
         ),
         types.Tool(
             name="delete_folder",
-            description=(
-                "Delete an IMAP folder. Refuses special-use folders unless force=true."
-            ),
+            description="Delete an IMAP folder. Refuses special-use folders unless force=true.",
             inputSchema={"type": "object", "required": ["name"], "properties": {
                 "name": {"type": "string"},
                 "force": {"type": "boolean"},
@@ -251,6 +251,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
                 "body": {"type": "string"},
                 "html": {"type": "string"},
                 "in_reply_to": {"type": "string"},
+                "references": {"type": "string"},
                 "headers": {"type": "object"},
                 "account": {"type": "string"},
             }},
@@ -266,6 +267,7 @@ def _list_tools(registry: AccountRegistry) -> list[types.Tool]:
                 "body": {"type": "string"},
                 "html": {"type": "string"},
                 "in_reply_to": {"type": "string"},
+                "references": {"type": "string"},
                 "headers": {"type": "object"},
                 "account": {"type": "string"},
             }},
@@ -394,12 +396,213 @@ def _list_prompts() -> list[types.Prompt]:
 
 
 # ---------------------------------------------------------------------------
+# Dispatch table
+# ---------------------------------------------------------------------------
+
+def _build_dispatch(ctx: Context, registry: AccountRegistry):
+    """Return a dict mapping tool name → async callable(args) → dict."""
+
+    async def _list_accounts(args):
+        return list_accounts(registry)
+
+    async def _test_connection(args):
+        return await test_connection(registry, account=args.get("account"))
+
+    async def _list_messages(args):
+        return await list_messages(
+            ctx,
+            folder=args.get("folder", "INBOX"),
+            limit=args.get("limit", 50),
+            cursor=args.get("cursor"),
+            order=args.get("order", "newest"),
+            account=args.get("account"),
+        )
+
+    async def _search_emails(args):
+        return await search_emails(
+            ctx,
+            query=args["query"],
+            folder=args.get("folder", "INBOX"),
+            limit=args.get("limit", 50),
+            cursor=args.get("cursor"),
+            order=args.get("order", "newest"),
+            account=args.get("account"),
+        )
+
+    async def _read_email(args):
+        return await read_email(
+            ctx,
+            id=args["id"],
+            include_raw=args.get("include_raw", False),
+            account=args.get("account"),
+        )
+
+    async def _download_attachment(args):
+        return await download_attachment(
+            ctx,
+            id=args["id"],
+            part_id=args["part_id"],
+            save_to=args["save_to"],
+            account=args.get("account"),
+        )
+
+    async def _list_folders(args):
+        return await list_folders(ctx, account=args.get("account"))
+
+    async def _folder_status(args):
+        return await folder_status(ctx, name=args["name"], account=args.get("account"))
+
+    async def _set_flags(args):
+        return await set_flags(
+            ctx,
+            id=args["id"],
+            add=args.get("add", []),
+            remove=args.get("remove", []),
+            account=args.get("account"),
+        )
+
+    async def _mark_read(args):
+        return await mark_read(ctx, id=args["id"], account=args.get("account"))
+
+    async def _mark_unread(args):
+        return await mark_unread(ctx, id=args["id"], account=args.get("account"))
+
+    async def _star(args):
+        return await star(ctx, id=args["id"], account=args.get("account"))
+
+    async def _unstar(args):
+        return await unstar(ctx, id=args["id"], account=args.get("account"))
+
+    async def _move_email(args):
+        return await move_email(
+            ctx, id=args["id"], to_folder=args["to_folder"],
+            account=args.get("account"),
+        )
+
+    async def _copy_email(args):
+        return await copy_email(
+            ctx, id=args["id"], to_folder=args["to_folder"],
+            account=args.get("account"),
+        )
+
+    async def _delete_email(args):
+        return await delete_email(
+            ctx, id=args["id"], hard=args.get("hard", False),
+            account=args.get("account"),
+        )
+
+    async def _empty_trash(args):
+        return await empty_trash(
+            ctx, account=args.get("account"), confirm=args.get("confirm", False),
+        )
+
+    async def _create_folder(args):
+        return await create_folder(ctx, name=args["name"], account=args.get("account"))
+
+    async def _rename_folder(args):
+        return await rename_folder(
+            ctx, from_name=args["from_name"], to_name=args["to_name"],
+            account=args.get("account"),
+        )
+
+    async def _delete_folder(args):
+        return await delete_folder(
+            ctx, name=args["name"], account=args.get("account"),
+            force=args.get("force", False),
+        )
+
+    async def _subscribe_folder(args):
+        return await subscribe_folder(ctx, name=args["name"], account=args.get("account"))
+
+    async def _unsubscribe_folder(args):
+        return await unsubscribe_folder(ctx, name=args["name"], account=args.get("account"))
+
+    async def _send_email(args):
+        return await send_email(
+            ctx,
+            to=args["to"], subject=args["subject"], body=args["body"],
+            cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
+            in_reply_to=args.get("in_reply_to"), references=args.get("references"),
+            headers=args.get("headers"), account=args.get("account"),
+        )
+
+    async def _save_draft(args):
+        return await save_draft(
+            ctx,
+            to=args["to"], subject=args["subject"], body=args["body"],
+            cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
+            in_reply_to=args.get("in_reply_to"), references=args.get("references"),
+            headers=args.get("headers"), account=args.get("account"),
+        )
+
+    async def _batch_set_flags(args):
+        return await batch_set_flags(
+            ctx, ids=args["ids"],
+            add=args.get("add", []), remove=args.get("remove", []),
+            account=args.get("account"),
+            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
+        )
+
+    async def _batch_move(args):
+        return await batch_move(
+            ctx, ids=args["ids"], to_folder=args["to_folder"],
+            account=args.get("account"),
+            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
+        )
+
+    async def _batch_delete(args):
+        return await batch_delete(
+            ctx, ids=args["ids"], hard=args.get("hard", False),
+            account=args.get("account"),
+            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
+        )
+
+    async def _get_or_create_folder(args):
+        return await get_or_create_folder(ctx, name=args["name"], account=args.get("account"))
+
+    return {
+        "list_accounts": _list_accounts,
+        "test_connection": _test_connection,
+        "list_messages": _list_messages,
+        "search_emails": _search_emails,
+        "read_email": _read_email,
+        "download_attachment": _download_attachment,
+        "list_folders": _list_folders,
+        "folder_status": _folder_status,
+        "set_flags": _set_flags,
+        "mark_read": _mark_read,
+        "mark_unread": _mark_unread,
+        "star": _star,
+        "unstar": _unstar,
+        "move_email": _move_email,
+        "copy_email": _copy_email,
+        "delete_email": _delete_email,
+        "empty_trash": _empty_trash,
+        "create_folder": _create_folder,
+        "rename_folder": _rename_folder,
+        "delete_folder": _delete_folder,
+        "subscribe_folder": _subscribe_folder,
+        "unsubscribe_folder": _unsubscribe_folder,
+        "send_email": _send_email,
+        "save_draft": _save_draft,
+        "batch_set_flags": _batch_set_flags,
+        "batch_move": _batch_move,
+        "batch_delete": _batch_delete,
+        "get_or_create_folder": _get_or_create_folder,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Server factory
 # ---------------------------------------------------------------------------
 
 def build_server(registry: AccountRegistry) -> Server:
     pool = ImapPool(registry)
     audit = AuditLog()
+    resolver = MessageResolver()
+    ctx = Context(pool=pool, registry=registry, audit=audit, resolver=resolver)
+    dispatch = _build_dispatch(ctx, registry)
+
     server = Server("imap-mcp")
 
     @server.list_tools()
@@ -430,7 +633,9 @@ def build_server(registry: AccountRegistry) -> Server:
         return _list_prompts()
 
     @server.get_prompt()
-    async def handle_get_prompt(name: str, arguments: Optional[dict] = None) -> types.GetPromptResult:
+    async def handle_get_prompt(
+        name: str, arguments: Optional[dict] = None
+    ) -> types.GetPromptResult:
         prompts = {p.name: p for p in _list_prompts()}
         if name not in prompts:
             raise ValueError(f"Prompt not found: {name}")
@@ -488,172 +693,16 @@ def build_server(registry: AccountRegistry) -> Server:
 
     @server.call_tool()
     async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-        acc = arguments.get("account")
-        result = await _dispatch_tool(name, arguments, registry, pool, audit)
+        handler = dispatch.get(name)
+        if handler is None:
+            raise ValueError(f"Unknown tool: {name}")
+        try:
+            result = await handler(arguments)
+        except ImapMcpError as exc:
+            result = exc.to_dict()
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
-
-
-async def _dispatch_tool(
-    name: str,
-    args: dict,
-    registry: AccountRegistry,
-    pool: ImapPool,
-    audit: AuditLog,
-) -> dict:
-    """Dispatch a tool call to the appropriate handler."""
-    # M0 admin
-    if name == "list_accounts":
-        return list_accounts(registry)
-    if name == "test_connection":
-        return await test_connection(registry, account=args.get("account"))
-
-    # M1 read
-    if name == "list_messages":
-        return await list_messages(
-            pool,
-            account=args.get("account"),
-            folder=args.get("folder", "INBOX"),
-            limit=args.get("limit", 50),
-            cursor=args.get("cursor"),
-            order=args.get("order", "newest"),
-        )
-    if name == "search_emails":
-        return await search_emails(
-            pool,
-            query=args["query"],
-            account=args.get("account"),
-            folder=args.get("folder", "INBOX"),
-            limit=args.get("limit", 50),
-            cursor=args.get("cursor"),
-            order=args.get("order", "newest"),
-        )
-    if name == "read_email":
-        return await read_email(
-            pool,
-            id=args["id"],
-            account=args.get("account"),
-            include_raw=args.get("include_raw", False),
-        )
-    if name == "download_attachment":
-        return await download_attachment(
-            pool,
-            id=args["id"],
-            part_id=args["part_id"],
-            save_to=args["save_to"],
-            account=args.get("account"),
-        )
-    if name == "list_folders":
-        return await list_folders(pool, account=args.get("account"))
-    if name == "folder_status":
-        return await folder_status(pool, name=args["name"], account=args.get("account"))
-
-    # M2 flags
-    if name == "set_flags":
-        return await set_flags(
-            pool,
-            id=args["id"],
-            add=args.get("add", []),
-            remove=args.get("remove", []),
-            account=args.get("account"),
-            audit=audit,
-        )
-    if name == "mark_read":
-        return await mark_read(pool, id=args["id"], account=args.get("account"), audit=audit)
-    if name == "mark_unread":
-        return await mark_unread(pool, id=args["id"], account=args.get("account"), audit=audit)
-    if name == "star":
-        return await star(pool, id=args["id"], account=args.get("account"), audit=audit)
-    if name == "unstar":
-        return await unstar(pool, id=args["id"], account=args.get("account"), audit=audit)
-
-    # M2 moves
-    if name == "move_email":
-        return await move_email(
-            pool, id=args["id"], to_folder=args["to_folder"],
-            account=args.get("account"), audit=audit,
-        )
-    if name == "copy_email":
-        return await copy_email(
-            pool, id=args["id"], to_folder=args["to_folder"],
-            account=args.get("account"), audit=audit,
-        )
-    if name == "delete_email":
-        return await delete_email(
-            pool, id=args["id"], hard=args.get("hard", False),
-            account=args.get("account"), audit=audit, registry=registry,
-        )
-    if name == "empty_trash":
-        return await empty_trash(
-            pool, account=args.get("account"), confirm=args.get("confirm", False),
-            audit=audit, registry=registry,
-        )
-
-    # M2 folder CRUD
-    if name == "create_folder":
-        return await create_folder(
-            pool, name=args["name"], account=args.get("account"), audit=audit
-        )
-    if name == "rename_folder":
-        return await rename_folder(
-            pool, from_name=args["from_name"], to_name=args["to_name"],
-            account=args.get("account"), audit=audit,
-        )
-    if name == "delete_folder":
-        return await delete_folder(
-            pool, name=args["name"], account=args.get("account"),
-            force=args.get("force", False), audit=audit,
-        )
-    if name == "get_or_create_folder":
-        return await get_or_create_folder(
-            pool, name=args["name"], account=args.get("account"), audit=audit
-        )
-    if name == "subscribe_folder":
-        return await subscribe_folder(pool, name=args["name"], account=args.get("account"))
-    if name == "unsubscribe_folder":
-        return await unsubscribe_folder(pool, name=args["name"], account=args.get("account"))
-
-    # M3 outbound
-    if name == "send_email":
-        return await send_email(
-            pool, registry=registry,
-            to=args["to"], subject=args["subject"], body=args["body"],
-            cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
-            in_reply_to=args.get("in_reply_to"), headers=args.get("headers"),
-            account=args.get("account"), audit=audit,
-        )
-    if name == "save_draft":
-        return await save_draft(
-            pool, registry=registry,
-            to=args["to"], subject=args["subject"], body=args["body"],
-            cc=args.get("cc"), bcc=args.get("bcc"), html=args.get("html"),
-            in_reply_to=args.get("in_reply_to"), headers=args.get("headers"),
-            account=args.get("account"), audit=audit,
-        )
-
-    # M4 batch
-    if name == "batch_set_flags":
-        return await batch_set_flags(
-            pool, ids=args["ids"],
-            add=args.get("add", []), remove=args.get("remove", []),
-            account=args.get("account"), audit=audit, registry=registry,
-            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
-        )
-    if name == "batch_move":
-        return await batch_move(
-            pool, ids=args["ids"], to_folder=args["to_folder"],
-            account=args.get("account"), audit=audit, registry=registry,
-            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
-        )
-    if name == "batch_delete":
-        return await batch_delete(
-            pool, ids=args["ids"], hard=args.get("hard", False),
-            account=args.get("account"), audit=audit, registry=registry,
-            confirm=args.get("confirm", False), dry_run=args.get("dry_run", False),
-        )
-
-    raise ValueError(f"Unknown tool: {name}")
 
 
 async def run():
