@@ -1,17 +1,29 @@
 services:
   imap-mcp:
     build: .
-    ports:
-      - "8000:8000"
+    networks:
+      - webproxy
     volumes:
       # rw so the setup wizard can write config.yaml on first start
       - ./config:/config
     environment:
-      # Required for production: set this to your public HTTPS URL so that
-      # the OAuth flow works for external clients (e.g. Claude Cowork).
-      # Without it the server defaults to http://localhost:8000 and will
-      # only work for local testing.
-      - IMAP_MCP_ISSUER_URL=${IMAP_MCP_ISSUER_URL:-http://localhost:8000}
+      # Must match the Traefik hostname below so OAuth works end-to-end.
+      - IMAP_MCP_ISSUER_URL=https://imap-mcp.yourdomain.com
       # Add further entries if you use secret_ref: "env:..." in config.yaml.
       # Example: - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=webproxy
+
+      - traefik.http.routers.imap_mcp.rule=Host(`imap-mcp.yourdomain.com`)
+      - traefik.http.routers.imap_mcp.entrypoints=websecure
+      - traefik.http.routers.imap_mcp.tls=true
+      - traefik.http.routers.imap_mcp.tls.certresolver=dns
+      - traefik.http.routers.imap_mcp.tls.domains[0].main=imap-mcp.yourdomain.com
+
+      - traefik.http.services.imap_mcp.loadbalancer.server.port=8000
     restart: unless-stopped
+
+networks:
+  webproxy:
+    external: true
