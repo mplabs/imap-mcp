@@ -6,9 +6,12 @@ services:
     volumes:
       # rw so the setup wizard can write config.yaml on first start
       - ./config:/config
-    # No credentials needed — the setup wizard collects them via the browser.
-    # Add an environment: section only if you use secret_ref: "env:..." in a
-    # manually written config. Example:
-    # environment:
-    #   - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
+    environment:
+      # Required for production: set this to your public HTTPS URL so that
+      # the OAuth flow works for external clients (e.g. Claude Cowork).
+      # Without it the server defaults to http://localhost:8000 and will
+      # only work for local testing.
+      - IMAP_MCP_ISSUER_URL=${IMAP_MCP_ISSUER_URL:-http://localhost:8000}
+      # Add further entries if you use secret_ref: "env:..." in config.yaml.
+      # Example: - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
     restart: unless-stopped

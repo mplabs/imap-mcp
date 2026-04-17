@@ -941,8 +941,18 @@ async def run_http(
     token_verifier = ProviderTokenVerifier(auth_provider)
     setup_key = load_or_create_setup_key()
 
-    # Determine issuer URL
-    effective_issuer = issuer_url or (cfg.server.issuer_url if cfg else "") or f"http://{host}:{port}"
+    # Determine issuer URL.
+    # The MCP SDK requires HTTPS for any non-localhost issuer (RFC 8414).
+    # For local/Docker testing without a reverse proxy, localhost is accepted.
+    # For production, set --issuer-url https://your-domain.com or the
+    # IMAP_MCP_ISSUER_URL environment variable.
+    import os as _os
+    effective_issuer = (
+        issuer_url
+        or (cfg.server.issuer_url if cfg else "")
+        or _os.environ.get("IMAP_MCP_ISSUER_URL", "")
+        or f"http://localhost:{port}"
+    )
     issuer = AnyHttpUrl(effective_issuer)
 
     auth_routes = create_auth_routes(
@@ -993,7 +1003,21 @@ async def run_http(
     logger.info("imap-mcp HTTP server starting on %s:%d", host, port)
     logger.info("Setup wizard: http://%s:%d/setup", host, port)
     logger.info("Setup key: %s", setup_key)
-    # Also print to stdout so it's visible even without log config
+
+    # Warn if the issuer URL is still localhost but the server is bound to
+    # a non-loopback address — OAuth will work locally but not from external clients.
+    if "localhost" in effective_issuer and host not in ("localhost", "127.0.0.1"):
+        print(
+            "\n  WARNING: OAuth issuer URL is set to localhost but the server is"
+            f" bound to {host}.\n"
+            "  External clients (e.g. Claude Cowork) will not be able to complete"
+            " the OAuth flow.\n"
+            "  Set IMAP_MCP_ISSUER_URL=https://your-domain.com or pass"
+            " --issuer-url.\n",
+            flush=True,
+        )
+
+    # Print setup key to stdout so it's visible in Docker logs.
     print(f"\n  imap-mcp setup key: {setup_key}\n", flush=True)
 
     await uv_server.serve()
