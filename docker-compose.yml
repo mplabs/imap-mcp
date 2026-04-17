@@ -6,8 +6,9 @@ services:
     volumes:
       # rw so the setup wizard can write config.yaml on first start
       - ./config:/config
-    environment:
-      # No credentials needed here — the setup wizard collects them via the browser.
-      # Add env vars only if you use secret_ref: "env:..." in a manually written config.
-      # Example: - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
+    # No credentials needed — the setup wizard collects them via the browser.
+    # Add an environment: section only if you use secret_ref: "env:..." in a
+    # manually written config. Example:
+    # environment:
+    #   - IMAP_PERSONAL_PASS=${IMAP_PERSONAL_PASS}
     restart: unless-stopped
