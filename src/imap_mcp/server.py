@@ -498,7 +498,7 @@ def _build_dispatch(ctx: Context, registry: AccountRegistry):
         return await search_emails(
             ctx,
             query=args["query"],
-            folder=args.get("folder", "INBOX"),
+            folder=args.get("folder"),  # None → fan-out across all folders
             limit=args.get("limit", 50),
             cursor=args.get("cursor"),
             order=args.get("order", "newest"),
@@ -714,10 +714,10 @@ class _SessionServer(Server):
         self._resolver_var = var
         self._resolver_factory = factory
 
-    async def run(self, read_stream, write_stream, initialization_options):  # type: ignore[override]
+    async def run(self, read_stream, write_stream, initialization_options, **kwargs):  # type: ignore[override]
         tok = self._resolver_var.set(self._resolver_factory())
         try:
-            await super().run(read_stream, write_stream, initialization_options)
+            await super().run(read_stream, write_stream, initialization_options, **kwargs)
         finally:
             self._resolver_var.reset(tok)
 
@@ -849,14 +849,20 @@ def build_server(registry: AccountRegistry) -> _SessionServer:
 
         return types.GetPromptResult(messages=messages)
 
+    import logging as _logging
+    _tool_log = _logging.getLogger("imap_mcp.tools")
+
     @server.call_tool()
     async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         handler = dispatch.get(name)
         if handler is None:
             raise ValueError(f"Unknown tool: {name}")
+        _tool_log.info("→ %s %s", name, arguments)
         try:
             result = await handler(arguments)
+            _tool_log.info("← %s ok", name)
         except ImapMcpError as exc:
+            _tool_log.warning("← %s error: %s", name, exc)
             result = exc.to_dict()
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -888,9 +894,13 @@ async def run_http(
     import logging
 
     import uvicorn
+    from mcp.server.auth.handlers.metadata import MetadataHandler
     from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, RequireAuthMiddleware
     from mcp.server.auth.provider import ProviderTokenVerifier
+    from mcp.server.auth.routes import build_metadata as _build_metadata
+    from mcp.server.auth.routes import cors_middleware as _auth_cors
     from mcp.server.auth.routes import create_auth_routes
+    from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from pydantic import AnyHttpUrl
     from starlette.applications import Starlette
@@ -936,11 +946,6 @@ async def run_http(
         session_idle_timeout=1800,
     )
 
-    # OAuth provider + setup wizard
-    auth_provider = JsonFileOAuthProvider()
-    token_verifier = ProviderTokenVerifier(auth_provider)
-    setup_key = load_or_create_setup_key()
-
     # Determine issuer URL.
     # The MCP SDK requires HTTPS for any non-localhost issuer (RFC 8414).
     # For local/Docker testing without a reverse proxy, localhost is accepted.
@@ -955,9 +960,34 @@ async def run_http(
     )
     issuer = AnyHttpUrl(effective_issuer)
 
+    from urllib.parse import urlparse as _urlparse
+    issuer_root_path = _urlparse(effective_issuer).path.rstrip("/")
+
+    # OAuth provider + setup wizard
+    # Persist OAuth state and setup key to the config directory (Docker volume)
+    # so they survive container restarts.
+    config_dir = Path(config_path).parent
+    auth_provider = JsonFileOAuthProvider(
+        state_path=config_dir / ".oauth.json",
+        setup_path=f"{issuer_root_path}/setup",
+    )
+    token_verifier = ProviderTokenVerifier(auth_provider)
+    setup_key = load_or_create_setup_key(config_dir / ".setup_key")
+
     auth_routes = create_auth_routes(
         provider=auth_provider,
         issuer_url=issuer,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    )
+
+    # Build the same metadata object so we can serve it at /.well-known/openid-configuration.
+    # Claude Cowork tries openid-configuration (OpenID Connect discovery) rather than
+    # oauth-authorization-server (RFC 8414) after fetching the protected resource metadata.
+    _oauth_metadata = _build_metadata(
+        issuer,
+        None,  # service_documentation_url
+        ClientRegistrationOptions(enabled=True),
+        RevocationOptions(),
     )
     wizard_routes = create_setup_routes(
         auth_provider=auth_provider,
@@ -965,10 +995,44 @@ async def run_http(
         setup_key=setup_key,
     )
 
+    resource_metadata_uri = f"{effective_issuer}/.well-known/oauth-protected-resource"
+
     async def mcp_asgi(scope, receive, send):
         await session_manager.handle_request(scope, receive, send)
 
     mcp_with_auth = RequireAuthMiddleware(mcp_asgi, required_scopes=[])
+
+    # Wrap the MCP endpoint to inject resource_metadata_uri into 401 responses.
+    # Without it, MCP clients cannot discover the OAuth authorization server.
+    _rmu = resource_metadata_uri  # capture for closure
+
+    async def mcp_with_resource_metadata(scope, receive, send):
+        async def _send(message):
+            if message["type"] == "http.response.start" and message["status"] == 401:
+                from starlette.datastructures import MutableHeaders
+                headers = MutableHeaders(scope=message)
+                # Append resource metadata hints to the existing WWW-Authenticate header.
+                # We include both the RFC 9728 name (resource_metadata) and the non-standard
+                # alias (resource_metadata_uri) for compatibility with Claude Cowork.
+                wwa = headers.get("www-authenticate", "Bearer")
+                if "resource_metadata" not in wwa:
+                    headers["www-authenticate"] = (
+                        f'{wwa}, resource_metadata="{_rmu}", resource_metadata_uri="{_rmu}"'
+                    )
+            await send(message)
+        await mcp_with_auth(scope, receive, _send)
+
+    from starlette.requests import Request as _Request
+    from starlette.responses import JSONResponse as _JSONResponse
+    from starlette.routing import Route as _Route
+
+    async def _protected_resource_metadata(request: _Request):
+        return _JSONResponse({
+            "resource": effective_issuer,
+            "authorization_servers": [effective_issuer],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": [],
+        })
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -978,9 +1042,23 @@ async def run_http(
     app = Starlette(
         lifespan=lifespan,
         routes=[
+            _Route(
+                "/.well-known/oauth-protected-resource",
+                endpoint=_protected_resource_metadata,
+                methods=["GET"],
+            ),
+            # OpenID Connect discovery alias.
+            # Claude Cowork requests /.well-known/openid-configuration (rather than
+            # /.well-known/oauth-authorization-server) when looking up the auth server.
+            # Return identical content so discovery succeeds.
+            _Route(
+                "/.well-known/openid-configuration",
+                endpoint=_auth_cors(MetadataHandler(_oauth_metadata).handle, ["GET", "OPTIONS"]),
+                methods=["GET", "OPTIONS"],
+            ),
             *auth_routes,
             *wizard_routes,
-            Mount("/mcp", app=mcp_with_auth),
+            Mount("/mcp", app=mcp_with_resource_metadata),
         ],
         middleware=[
             Middleware(
@@ -991,12 +1069,43 @@ async def run_http(
     )
 
     timeout = cfg.server.request_timeout_s if cfg else 60
+
+    _log_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s %(name)-24s %(levelname)-8s %(message)s",
+                "datefmt": "%H:%M:%S",
+            },
+        },
+        "handlers": {
+            "default": {
+                "class": "logging.StreamHandler",
+                "formatter": "default",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            # Uvicorn startup messages — keep at INFO
+            "uvicorn":        {"handlers": ["default"], "level": "INFO",    "propagate": False},
+            "uvicorn.error":  {"handlers": ["default"], "level": "INFO",    "propagate": False},
+            # HTTP access log is too noisy; only show warnings and above
+            "uvicorn.access": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+            # Application logs — tool calls, errors, session events
+            "imap_mcp":       {"handlers": ["default"], "level": "INFO",    "propagate": False},
+        },
+    }
+
     uv_config = uvicorn.Config(
         app=app,
         host=host,
         port=port,
         timeout_keep_alive=timeout,
-        log_level="info",
+        log_config=_log_config,
+        root_path=issuer_root_path,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
     uv_server = uvicorn.Server(uv_config)
 

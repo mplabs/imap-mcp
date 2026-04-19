@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlencode
 
 from starlette.requests import Request
@@ -34,13 +35,14 @@ _SETUP_KEY_PATH = Path.home() / ".local" / "state" / "imap-mcp" / "setup_key"
 # Setup key management
 # ---------------------------------------------------------------------------
 
-def load_or_create_setup_key() -> str:
+def load_or_create_setup_key(key_path: Optional[Path] = None) -> str:
     """Return the persistent setup key, creating it on first call."""
-    _SETUP_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if _SETUP_KEY_PATH.exists():
-        return _SETUP_KEY_PATH.read_text().strip()
+    path = key_path or _SETUP_KEY_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path.read_text().strip()
     key = secrets.token_urlsafe(16)
-    _SETUP_KEY_PATH.write_text(key)
+    path.write_text(key)
     return key
 
 
@@ -101,7 +103,7 @@ _PAGE = """\
 
   {alert}
 
-  <form method="post" action="/setup">
+  <form method="post" action="">
     <input type="hidden" name="oauth_state" value="{oauth_state}">
 
     <div class="field">

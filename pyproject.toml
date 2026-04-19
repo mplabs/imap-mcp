@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "imap-mcp"
-version = "0.1.0"
+version = "0.1.15"
 description = "Generic IMAP/SMTP MCP server for Claude agents"
 requires-python = ">=3.11"
 dependencies = [

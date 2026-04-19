@@ -178,7 +178,17 @@ async def search_emails(
     limit = min(limit, 500)
 
     if "raw" in query:
-        criteria = [query["raw"]]
+        # The raw IMAP search string must be split into tokens so imapclient
+        # can assemble the correct SEARCH command.  A single-element list like
+        # ['FROM "ollama.com"'] gets passed as one quoted token and fails;
+        # shlex.split() handles quoted arguments correctly:
+        #   'FROM "ollama.com"'  →  ["FROM", "ollama.com"]
+        #   'SUBJECT "hi there"' →  ["SUBJECT", "hi there"]
+        import shlex as _shlex
+        try:
+            criteria = _shlex.split(query["raw"])
+        except ValueError:
+            criteria = [query["raw"]]
     elif "gmail_raw" in query:
         criteria = [f"X-GM-RAW {query['gmail_raw']}"]
     else:

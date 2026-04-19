@@ -24,10 +24,14 @@ async def list_folders(
     """List all folders on the IMAP server, including subscribed state."""
     with ctx.pool.acquire(account, "INBOX") as conn:
         raw_folders = conn.client.list_folders()
-        # lsub() returns the set of subscribed folders
-        subscribed_raw = conn.client.lsub()
-
-    subscribed_names = {name for _, _, name in subscribed_raw}
+        try:
+            # lsub() returns the set of subscribed folders (IMAP4rev1).
+            # Some servers (e.g. Exchange, Fastmail) don't implement LSUB;
+            # fall back to treating every folder as subscribed.
+            subscribed_raw = conn.client.lsub()
+            subscribed_names = {name for _, _, name in subscribed_raw}
+        except Exception:
+            subscribed_names = {name for _, _, name in raw_folders}
 
     folders = []
     for flags, delimiter, name in raw_folders:

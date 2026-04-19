@@ -42,8 +42,9 @@ _EMPTY: dict = {
 class JsonFileOAuthProvider(OAuthAuthorizationServerProvider):
     """Implements OAuthAuthorizationServerProvider with JSON file storage."""
 
-    def __init__(self, state_path: Optional[Path] = None) -> None:
+    def __init__(self, state_path: Optional[Path] = None, setup_path: str = "/setup") -> None:
         self._path = state_path or _DEFAULT_STATE_PATH
+        self._setup_path = setup_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if not self._path.exists():
             self._write(_EMPTY.copy())
@@ -100,7 +101,7 @@ class JsonFileOAuthProvider(OAuthAuthorizationServerProvider):
             "expires_at": time.time() + 600,  # 10-minute window
         }
         self._write(data)
-        return f"/setup?oauth_state={nonce}"
+        return f"{self._setup_path}?oauth_state={nonce}"
 
     async def load_authorization_code(
         self,
