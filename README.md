@@ -69,30 +69,37 @@ An MCP server that gives Claude agents full access to any IMAP mailbox (plus SMT
 
 ### Claude Cowork (remote, HTTP + Docker)
 
-1. **Create a config directory** and start the server:
+The fastest way to get started is the **web-based setup wizard** — no config file to write by hand.
+
+1. **Pull and start the server:**
    ```bash
    mkdir -p config
+   docker run -d \
+     --name imap-mcp \
+     -p 8000:8000 \
+     -v ./config:/config \
+     -e IMAP_MCP_ISSUER_URL=https://your-server.example.com \
+     ghcr.io/mplabs/imap-mcp:latest \
+     imap-mcp --transport http --config /config/config.yaml
+   ```
+   Or with the included `docker-compose.yml`:
+   ```bash
    docker compose up -d
    ```
-   No config file needed — the setup wizard creates it.
 
-2. **Note the setup key** printed in the server logs:
-   ```
-   docker compose logs imap-mcp
+2. **Note the setup key** printed in the logs:
+   ```bash
+   docker logs imap-mcp
    # look for:  imap-mcp setup key: abc123...
    ```
 
-3. **Add to Claude Cowork** — paste `https://your-server:8000/mcp` as the server URL. Claude Cowork will open a browser window to the setup wizard automatically.
+3. **Add to Claude Cowork** — paste `https://your-server.example.com/mcp` as the server URL. Claude Cowork will open a browser window to the setup wizard automatically.
 
-4. **Fill in your mail credentials** and paste the setup key when prompted. The server tests the connection live and saves the config. Done — Claude Cowork is connected.
+4. **Fill in your mail credentials** and paste the setup key when prompted. The server tests the connection live and saves `config.yaml` to the mounted volume. Done — Claude Cowork is connected.
 
-   > **TLS required for public deployments.** The server itself does not terminate TLS. Put nginx, Caddy, or a load balancer in front. See [TLS with a reverse proxy](#tls-with-a-reverse-proxy).
+   > **TLS required for public deployments.** The server does not terminate TLS itself. Put nginx, Caddy, or a load balancer in front. See [TLS with a reverse proxy](#tls-with-a-reverse-proxy).
    >
-   > For a public server, also set `issuer_url` in the server config block:
-   > ```yaml
-   > server:
-   >   issuer_url: "https://your-server.example.com"
-   > ```
+   > Set `IMAP_MCP_ISSUER_URL` to your public HTTPS URL so that OAuth tokens resolve correctly.
 
 ---
 
@@ -282,6 +289,16 @@ imap-mcp [--transport stdio|http] [--host HOST] [--port PORT] [--config PATH]
 
 ## Docker deployment
 
+### Pre-built image
+
+Images are published to the GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/mplabs/imap-mcp:latest
+# or pin to a version:
+docker pull ghcr.io/mplabs/imap-mcp:0.1.15
+```
+
 ### Build and run
 
 ```bash
@@ -292,11 +309,11 @@ docker compose up -d
 docker compose logs imap-mcp | grep "setup key"
 ```
 
-Then add `https://your-server:8000/mcp` to Claude Cowork. The browser-based setup wizard handles the rest.
+Then add `https://your-server/mcp` to Claude Cowork. The browser-based setup wizard handles the rest — no config file to write by hand.
 
 ### docker-compose.yml
 
-The included `docker-compose.yml` mounts the config directory read-write so the setup wizard can create `config.yaml` on first start.
+The included `docker-compose.yml` mounts `./config` read-write so the setup wizard can create `config.yaml` on first start and so credentials survive container restarts.
 
 ### TLS with a reverse proxy
 
